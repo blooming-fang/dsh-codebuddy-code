@@ -7,7 +7,7 @@ CodeBuddy LLM 提供商 bundle，为 DeepSeek Harness **Web GUI 的 LLM 能力**
 安装并重启后：
 
 - **Settings → Models** 出现一个 **CodeBuddy** 卡片（由 `registerConfigurableProviders` 提供），带设置表单、无凭据小圆点（因为 token 来自本机登录而非产品 API key）。
-- **聊天框模型选择器** 列出 CodeBuddy 的模型（`deepseek-v4-flash` / `deepseek-v4-pro`，可在 `llm-codebuddy:` 设置段里改），选中即可用 CodeBuddy 云接口对话。
+- **聊天框模型选择器** 列出 CodeBuddy 的模型，默认目录与 CodeBuddy CLI 的 `cli` agent 一致（`glm-5.x`、`kimi-k3-1`/`kimi-k2.x`、`minimax-m3`/`minimax-m2.7`、`hy3`、`deepseek-v4-pro`/`deepseek-v4-flash`、`deepseek-v3-2-volc` 等，可在 `llm-codebuddy:` 设置段的 `models` 里改），选中即可用 CodeBuddy 云接口对话。
 
 Token 来源（每次请求按序解析）：
 
@@ -38,21 +38,19 @@ dsh-codebuddy-code/
 
 ## 安装
 
-需要一个已初始化的 web profile。在此包**所在目录**（`plugins/dsh-codebuddy-code` 的父目录）或直接指到 tgz/包路径运行：
+需要一个已初始化的 web profile。从 npm 安装（已发布）：
 
 ```sh
-# 从源码目录安装（先打包，见下）
-dsh plugin --profile web add D:\path\to\dsh-codebuddy-code
-
-# 或安装打好的 tgz
-dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.1.0.tgz
+dsh plugin --profile web add dsh-codebuddy-code
 ```
 
 然后重启 `dsh web` 并打开 GUI。
 
 `dsh plugin --profile web remove dsh-codebuddy-code` 同时移除依赖与 bundle 层。
 
-## 打包为 tgz
+## 开发者：打包为 tgz（可选）
+
+普通用户无需这一步——直接 `dsh plugin --profile web add dsh-codebuddy-code` 从 npm 安装即可。仅当你在本地开发、需要手动打包时：
 
 ```sh
 cd plugins/dsh-codebuddy-code
@@ -75,10 +73,38 @@ llm-codebuddy:
   maxTokens: 4096                    # 默认 4096
   defaultContextWindow: 1000000      # 默认 1000000
   models:
-    - id: deepseek-v4-flash
-      name: CodeBuddy-V4-Flash
+    - id: hy3
+      name: CodeBuddy-Hy3
+    - id: glm-5.2
+      name: CodeBuddy-GLM-5.2
+    - id: glm-5.1
+      name: CodeBuddy-GLM-5.1
+    - id: glm-5.0
+      name: CodeBuddy-GLM-5.0
+    - id: glm-5.0-turbo
+      name: CodeBuddy-GLM-5.0-Turbo
+    - id: glm-5v-turbo
+      name: CodeBuddy-GLM-5V-Turbo
+    - id: glm-4.7
+      name: CodeBuddy-GLM-4.7
+    - id: minimax-m3
+      name: CodeBuddy-MiniMax-M3
+    - id: minimax-m2.7
+      name: CodeBuddy-MiniMax-M2.7
+    - id: kimi-k3-1
+      name: CodeBuddy-Kimi-K3
+    - id: kimi-k2.7
+      name: CodeBuddy-Kimi-K2.7
+    - id: kimi-k2.6
+      name: CodeBuddy-Kimi-K2.6
+    - id: kimi-k2.5
+      name: CodeBuddy-Kimi-K2.5
     - id: deepseek-v4-pro
       name: CodeBuddy-V4-Pro
+    - id: deepseek-v4-flash
+      name: CodeBuddy-V4-Flash
+    - id: deepseek-v3-2-volc
+      name: CodeBuddy-V3.2-Volc
   streamIdleTimeoutMs: 300000        # 默认 300000
   retryPolicy: {}                    # 可选
 ```
