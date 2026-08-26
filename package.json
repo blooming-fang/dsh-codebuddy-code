@@ -1,8 +1,18 @@
 {
   "name": "dsh-codebuddy-code",
   "version": "0.1.0",
-  "private": true,
   "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "codebuddy",
+    "llm",
+    "adapter",
+    "provider",
+    "plugin",
+    "bundle"
+  ],
+  "license": "MIT",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -13,18 +23,39 @@
     "cordis.patch.yml",
     "src"
   ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blooming-fang/dsh-codebuddy-code.git"
+  },
+  "bugs": {
+    "url": "https://github.com/blooming-fang/dsh-codebuddy-code/issues"
+  },
+  "homepage": "https://github.com/blooming-fang/dsh-codebuddy-code#readme",
+  "scripts": {
+    "prepack": "npm run pack:check",
+    "pack": "npm pack",
+    "pack:check": "node ./scripts/check-pack.mjs"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.2",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.2",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.2",
-    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.2",
+  "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
     "eventsource-parser": "^3.0.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.2 || ^0.1.1-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.2 || ^0.1.1-rc.1",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.2 || ^0.1.1-rc.1",
+    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.2 || ^0.1.1-rc.1"
   }
 }
