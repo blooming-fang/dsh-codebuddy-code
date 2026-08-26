@@ -1,0 +1,13 @@
+# dsh-codebuddy-code bundle layer.
+# One plugin row: registers the `codebuddy` provider route, its Models-page
+# card, and its model-picker entries. All config fields are optional — schema
+# defaults apply and the bearer session resolves per request from the CodeBuddy
+# desktop-app login (or CODEBUDDY_AUTH_TOKEN / CODEBUDDY_API_KEY env overrides).
+#
+# `name` must be the FULL package specifier as installed in the profile's
+# node_modules: the loader imports it as a module and pnpm links packages by
+# their true name, so a bare `dsh-codebuddy-code` here fails to resolve
+# (ERR_MODULE_NOT_FOUND) and crashes the app on boot.
+- insert:
+    - id: llm-codebuddy
+      name: "dsh-codebuddy-code"

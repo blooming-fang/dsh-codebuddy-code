@@ -1,0 +1,30 @@
+{
+  "name": "dsh-codebuddy-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "src"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.1.0-rc.2",
+    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "eventsource-parser": "^3.0.0"
+  }
+}
