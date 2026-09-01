@@ -1,6 +1,6 @@
 {
   "name": "dsh-codebuddy-code",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login",
   "keywords": [
     "deepseek-harness",

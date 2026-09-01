@@ -12,10 +12,10 @@ CodeBuddy LLM 提供商 bundle，为 DeepSeek Harness **Web GUI 的 LLM 能力**
 Token 来源（每次请求按序解析）：
 
 1. 环境变量覆盖：`CODEBUDDY_AUTH_TOKEN` 或 `CODEBUDDY_API_KEY`。
-2. CodeBuddy 桌面端登录文件：
-   `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info`，带过期检查——请先用 CodeBuddy 桌面端（或 `/login`）完成登录。
+2. CodeBuddy 桌面端登录文件：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info`，带过期检查——请先用 CodeBuddy 桌面端（或 `/login`）完成登录。
+3. 仅当 CodeBuddy 未登录时，回退到 WorkBuddy 桌面端登录文件 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`（两者写入相同结构，均可通过设置覆盖路径）。
 
-都不存在/过期时，请求以 `LlmError: MISSING_CREDENTIAL` 失败（不是插件加载失败）。
+都不存在/过期时，请求以 `LlmError: MISSING_CREDENTIAL` 失败（不是插件加载失败），错误信息会列出每个候选被拒绝的原因。
 
 请求走 `POST https://copilot.tencent.com/v2/chat/completions`，SSE 流式。地址可在配置里改。
 
@@ -68,6 +68,7 @@ npm pack
 llm-codebuddy:
   endpoint: https://copilot.tencent.com/v2/chat/completions   # 可选
   tokenPath: C:\Users\you\AppData\Local\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info  # 可选
+  workbuddyTokenPath: C:\Users\you\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info  # 可选，CodeBuddy 未登录时回退
   thinking: enabled                  # enabled | disabled（默认 disabled）
   reasoningEffort: off               # off | high | max（默认 off）
   maxTokens: 4096                    # 默认 4096
@@ -111,7 +112,7 @@ llm-codebuddy:
 
 ## 验证可用
 
-1. 先确认 CodeBuddy 桌面端已登录（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info` 存在且有 `auth.accessToken`）。
+1. 先确认 CodeBuddy 桌面端已登录（`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info` 存在且有 `auth.accessToken`）；未登录时插件会回退到 WorkBuddy 登录文件。
 2. 重启 `dsh web`，打开 **Settings → Models**，应看到 **CodeBuddy** 卡片。
 3. 回到聊天框，点模型选择器，选 **CodeBuddy** 下某个模型，发一条消息。
 

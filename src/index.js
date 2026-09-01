@@ -8,11 +8,13 @@
  * with. The one registration-captured fact — the retry policy — re-registers
  * the route in place when it changes.
  *
- * The bearer session is the machine's CodeBuddy login, not a product API key:
- * `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` env overrides win, then the
- * login document at `tokenPath` (the desktop app's auth file) is read with an
- * expiry check. No credential seam is involved, so the web Models page shows
- * this provider with its settings form and no credential dot.
+ * The bearer session is the machine's CodeBuddy (or WorkBuddy) login, not a
+ * product API key: `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` env overrides
+ * win, then the CodeBuddy login document at `tokenPath` (the desktop app's
+ * auth file) is read with an expiry check, and only when CodeBuddy is not
+ * logged in does the WorkBuddy login document at `workbuddyTokenPath` back it
+ * up. No credential seam is involved, so the web Models page shows this
+ * provider with its settings form and no credential dot.
  *
  * Self-contained port of `packages/llm/llm-codebuddy/src/index.ts` for the
  * `dsh-codebuddy-code` profile bundle. The provider appears on the web Models
@@ -47,10 +49,29 @@ const TOKEN_ENVS = ['CODEBUDDY_AUTH_TOKEN', 'CODEBUDDY_API_KEY']
 /** The chat-completions endpoint the CodeBuddy gateway serves. */
 export const DEFAULT_ENDPOINT = 'https://copilot.tencent.com/v2/chat/completions'
 
+// The advisory catalog mirrors the CodeBuddy CLI's own `cli` agent model list
+// (product.internal.json — the Tencent / copilot.tencent.com build), not the
+// hardcoded two-model subset previously shipped. These ids are what the
+// gateway actually serves; no per-model capacity is disclosed by the product
+// config, so every entry falls back to DEFAULT_CONTEXT_WINDOW.
 const DEFAULT_MODELS = [
-  { id: 'deepseek-v4-flash', name: 'CodeBuddy-V4-Flash', contextWindow: DEFAULT_CONTEXT_WINDOW },
-  { id: 'deepseek-v4-pro', name: 'CodeBuddy-V4-Pro', contextWindow: DEFAULT_CONTEXT_WINDOW },
-]
+  { id: 'hy3', name: 'CodeBuddy-Hy3' },
+  { id: 'glm-5.2', name: 'CodeBuddy-GLM-5.2' },
+  { id: 'glm-5.1', name: 'CodeBuddy-GLM-5.1' },
+  { id: 'glm-5.0', name: 'CodeBuddy-GLM-5.0' },
+  { id: 'glm-5.0-turbo', name: 'CodeBuddy-GLM-5.0-Turbo' },
+  { id: 'glm-5v-turbo', name: 'CodeBuddy-GLM-5V-Turbo' },
+  { id: 'glm-4.7', name: 'CodeBuddy-GLM-4.7' },
+  { id: 'minimax-m3', name: 'CodeBuddy-MiniMax-M3' },
+  { id: 'minimax-m2.7', name: 'CodeBuddy-MiniMax-M2.7' },
+  { id: 'kimi-k3-1', name: 'CodeBuddy-Kimi-K3' },
+  { id: 'kimi-k2.7', name: 'CodeBuddy-Kimi-K2.7' },
+  { id: 'kimi-k2.6', name: 'CodeBuddy-Kimi-K2.6' },
+  { id: 'kimi-k2.5', name: 'CodeBuddy-Kimi-K2.5' },
+  { id: 'deepseek-v4-pro', name: 'CodeBuddy-V4-Pro' },
+  { id: 'deepseek-v4-flash', name: 'CodeBuddy-V4-Flash' },
+  { id: 'deepseek-v3-2-volc', name: 'CodeBuddy-V3.2-Volc' },
+].map(model => ({ ...model, contextWindow: DEFAULT_CONTEXT_WINDOW }))
 
 /**
  * Plugin config, validated by the same-named schemastery schema and doubling
@@ -63,6 +84,7 @@ const DEFAULT_MODELS = [
  * @typedef {object} Config
  * @property {string} [endpoint] - Full chat-completions endpoint URL.
  * @property {string} [tokenPath] - Path to the CodeBuddy login document.
+ * @property {string} [workbuddyTokenPath] - Path to the fallback WorkBuddy login document, used only when the CodeBuddy one is not logged in.
  * @property {'enabled'|'disabled'} [thinking] - Deployment thinking policy.
  * @property {'off'|'high'|'max'} [reasoningEffort] - Default thinking effort (default `off`).
  * @property {number} [maxTokens] - Default per-request output cap (default 4,096).
@@ -83,6 +105,7 @@ const catalogModel = z.object({
 export const Config = z.object({
   endpoint: z.string().default(DEFAULT_ENDPOINT),
   tokenPath: z.string(),
+  workbuddyTokenPath: z.string(),
   thinking: z.union(['enabled', 'disabled']),
   reasoningEffort: z.union(['off', 'high', 'max']).default('off'),
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
@@ -92,14 +115,24 @@ export const Config = z.object({
   retryPolicy: RetryPolicySchema,
 })
 
-/** The desktop app's auth file name under LOCALAPPDATA; the tokenPath default. */
+/** The desktop app's CodeBuddy auth file name under LOCALAPPDATA; the tokenPath default. */
 const TOKEN_FILE_RELATIVE = join('CodeBuddyExtension', 'Data', 'Public', 'auth', 'Tencent-Cloud.coding-copilot.info')
+
+/** The desktop app's WorkBuddy auth file name under LOCALAPPDATA; the workbuddyTokenPath default. */
+const WORKBUDDY_TOKEN_FILE_RELATIVE = join('CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info')
 
 /** Compute the default login-document path from the ambient platform root. */
 export function defaultTokenPath() {
   const local = process.env.LOCALAPPDATA
   const base = local !== undefined && local.length > 0 ? local : join(homedir(), 'AppData', 'Local')
   return join(base, TOKEN_FILE_RELATIVE)
+}
+
+/** Compute the default WorkBuddy fallback login-document path from the ambient platform root. */
+export function defaultWorkbuddyTokenPath() {
+  const local = process.env.LOCALAPPDATA
+  const base = local !== undefined && local.length > 0 ? local : join(homedir(), 'AppData', 'Local')
+  return join(base, WORKBUDDY_TOKEN_FILE_RELATIVE)
 }
 
 /** Resolve, validate, and detach the advisory model catalog. */
@@ -167,6 +200,7 @@ export function resolveAdapterOptions(config) {
   return {
     endpoint: config.endpoint ?? DEFAULT_ENDPOINT,
     tokenPath: config.tokenPath ?? defaultTokenPath(),
+    workbuddyTokenPath: config.workbuddyTokenPath ?? defaultWorkbuddyTokenPath(),
     defaults: {
       thinking: config.thinking,
       reasoningEffort: config.reasoningEffort ?? 'off',
@@ -212,46 +246,53 @@ export function apply(ctx, config) {
         return { accessToken: assertUsableApiKey(ambient, 'llm-codebuddy', env) }
       }
     }
-    // Then the desktop app's login document, with the same expiry check the
-    // reference client performs.
+    // Then the desktop app's login documents, in priority order, each read
+    // with the same expiry check the reference client performs: CodeBuddy
+    // first, WorkBuddy only when CodeBuddy is not logged in.
+    const reasons = []
+    for (const tokenPath of [connection.tokenPath, connection.workbuddyTokenPath]) {
+      const session = await sessionFromDocument(tokenPath, reasons)
+      if (session !== undefined) return session
+    }
+    throw new LlmError(
+      `llm-codebuddy: no usable CodeBuddy or WorkBuddy login at ${connection.tokenPath} or`
+      + ` ${connection.workbuddyTokenPath}; ${reasons.join('; ')}; log in with the CodeBuddy desktop`
+      + ` app, or export ${TOKEN_ENVS.join(' / ')} in the launching environment`,
+      'MISSING_CREDENTIAL',
+    )
+  }
+
+  /**
+   * Resolve a bearer session from one login document, or return `undefined`
+   * with the failure reason appended when the document does not carry a usable
+   * token so the caller can try the next candidate. The desktop app writes the
+   * same document shape for both CodeBuddy and WorkBuddy.
+   */
+  const sessionFromDocument = async (tokenPath, reasons) => {
     let raw
     try {
-      raw = await readFile(connection.tokenPath, 'utf8')
+      raw = await readFile(tokenPath, 'utf8')
     } catch (cause) {
-      throw new LlmError(
-        `llm-codebuddy: cannot read CodeBuddy login at ${connection.tokenPath}; log in with the`
-        + ` CodeBuddy desktop app, or export ${TOKEN_ENVS.join(' / ')} in the launching environment`,
-        'MISSING_CREDENTIAL',
-        { cause },
-      )
+      reasons.push(`cannot read ${tokenPath}`)
+      return undefined
     }
     let login
     try {
       login = JSON.parse(raw)
     } catch (cause) {
-      throw new LlmError(
-        `llm-codebuddy: CodeBuddy login at ${connection.tokenPath} is not valid JSON; re-login with`
-        + ` the CodeBuddy desktop app, or export ${TOKEN_ENVS.join(' / ')}`,
-        'MISSING_CREDENTIAL',
-        { cause },
-      )
+      reasons.push(`${tokenPath} is not valid JSON`)
+      return undefined
     }
     if (typeof login.auth?.accessToken !== 'string' || login.auth.accessToken.length === 0) {
-      throw new LlmError(
-        `llm-codebuddy: CodeBuddy login at ${connection.tokenPath} carries no access token; re-login`
-        + ` with the CodeBuddy desktop app, or export ${TOKEN_ENVS.join(' / ')}`,
-        'MISSING_CREDENTIAL',
-      )
+      reasons.push(`${tokenPath} carries no access token`)
+      return undefined
     }
     if (typeof login.auth.expiresAt === 'number' && Date.now() > login.auth.expiresAt) {
-      throw new LlmError(
-        `llm-codebuddy: CodeBuddy login at ${connection.tokenPath} expired; re-login with the`
-        + ` CodeBuddy desktop app, or export ${TOKEN_ENVS.join(' / ')}`,
-        'MISSING_CREDENTIAL',
-      )
+      reasons.push(`${tokenPath} expired`)
+      return undefined
     }
     return {
-      accessToken: assertUsableApiKey(login.auth.accessToken, 'llm-codebuddy', connection.tokenPath),
+      accessToken: assertUsableApiKey(login.auth.accessToken, 'llm-codebuddy', tokenPath),
       ...(typeof login.account?.uid === 'string' && login.account.uid.length > 0
         ? { userId: login.account.uid }
         : {}),

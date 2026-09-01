@@ -29,8 +29,10 @@
 // how a non-2xx response maps to a stable LlmError code.
 
 // The login document written by the desktop app at tokenPath
-// (%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info).
-// Only the fields the session resolver reads are named here:
+// (%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info),
+// with the WorkBuddy fallback at workbuddyTokenPath (...\auth\workbuddy-desktop.info).
+// Both products write the same shape; only the fields the session resolver reads
+// are named here:
 //   { account: { uid, nickname?, uin?, type? }, auth: { accessToken, refreshToken?,
 //     tokenType?, expiresIn?, expiresAt, domain? } }
 

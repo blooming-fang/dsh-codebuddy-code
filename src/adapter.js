@@ -66,6 +66,7 @@ const OFF_ONLY_REASONING_EFFORTS = [
  * @typedef {object} CodeBuddyConnectionOptions
  * @property {string} endpoint - Full chat-completions endpoint URL.
  * @property {string} tokenPath - Path to the CodeBuddy login document.
+ * @property {string} workbuddyTokenPath - Path to the fallback WorkBuddy login document.
  * @property {object} defaults - Request defaults applied to every call.
  * @property {number} maxTokens - Default per-request output cap.
  * @property {number} defaultContextWindow - Context capacity when the model has no exact value.
