@@ -1,7 +1,7 @@
 {
   "name": "dsh-codebuddy-code",
-  "version": "0.2.2",
-  "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login",
+  "version": "0.3.0",
+  "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login, with per-model measured image input",
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -21,7 +21,9 @@
   },
   "files": [
     "cordis.patch.yml",
-    "src"
+    "scripts",
+    "src",
+    "tests"
   ],
   "engines": {
     "node": ">=22"
@@ -40,7 +42,9 @@
   "scripts": {
     "prepack": "npm run pack:check",
     "pack": "npm pack",
-    "pack:check": "node ./scripts/check-pack.mjs"
+    "pack:check": "node ./scripts/check-pack.mjs",
+    "test": "node ./tests/image-support.test.mjs",
+    "vision-probe": "node ./scripts/vision-probe.mjs --trials=3"
   },
   "dsh": {
     "bundle": {
@@ -53,6 +57,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-attachment": "^0.1.5-rc.1",
     "@deepseek-ai/dsh-invariants": "^0.1.5-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.5-rc.1",
     "@deepseek-ai/dsh-settings": "^0.1.5-rc.1",

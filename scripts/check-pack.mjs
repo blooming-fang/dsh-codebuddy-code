@@ -22,6 +22,11 @@ const REQUIRED = [
   'src/sse.js',
   'src/translate.js',
   'src/types.js',
+  // The vision-capability probe ships deliberately: the catalog's per-model
+  // `inputModalities` are MEASURED values, and this is the only way a
+  // maintainer can re-derive or verify them.
+  'scripts/vision-probe.mjs',
+  'tests/image-support.test.mjs',
 ]
 
 const missing = []

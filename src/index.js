@@ -27,13 +27,21 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
-import { assertUsableApiKey, LlmError, resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
+import {
+  assertUsableApiKey,
+  LlmError,
+  resolveImageAttachmentAccess,
+  resolveRetryPolicy,
+  RetryPolicySchema,
+} from '@deepseek-ai/dsh-llm'
 import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import {
   CodeBuddyAdapter,
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
+  DEFAULT_REQUEST_IMAGE_MAX_BYTES,
+  DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
 } from './adapter.js'
 
@@ -54,6 +62,41 @@ export const DEFAULT_ENDPOINT = 'https://copilot.tencent.com/v2/chat/completions
 // hardcoded two-model subset previously shipped. These ids are what the
 // gateway actually serves; no per-model capacity is disclosed by the product
 // config, so every entry falls back to DEFAULT_CONTEXT_WINDOW.
+//
+// `inputModalities` IS measured rather than declared, because neither the
+// product config nor the model NAME can be trusted about vision: the gateway
+// accepts an OpenAI `image_url` part for EVERY model it serves, so an HTTP 200
+// proves nothing. A text-only model answers confidently with a hallucinated
+// description instead of failing.
+//
+// The measurement (scripts/vision-probe.mjs) established the opposite of the
+// intuitive default: vision is the NORM on this gateway and text-only is the
+// exception. It sends a shuffled four-colour quadrant image, grades the answer
+// BY POSITION, and requires the no-image control to fail, over several trials.
+// Two earlier, weaker methods produced a badly wrong catalog, which is why the
+// exclusions below are a short deny-list and not a long allow-list:
+//   * asking for "red, green, blue, yellow" in the four quadrants let
+//     text-only models guess that canonical order outright (several scored 4/4
+//     blind), so the probe now shuffles the layout per trial;
+//   * a tight `max_tokens` truncated answers that arrive after a long
+//     `reasoning_content` preamble to "", which made several seeing models
+//     (glm-5.0-turbo, kimi-k2.7, minimax-m2.7, deepseek-v3-2-volc, hy3) look
+//     text-only. The probe now allows a generous budget.
+//
+// Measured 2026-09 against copilot.tencent.com — VISION (16): hy3, glm-5.2,
+// glm-5.1, glm-5.0, glm-5.0-turbo, minimax-m3, minimax-m2.7, kimi-k3-1,
+// kimi-k2.7, kimi-k2.6, kimi-k2.5, deepseek-v4-pro, deepseek-v4.1-flash,
+// deepseek-v4-flash, deepseek-v3-2-volc.
+// TEXT-ONLY: `glm-5v-turbo` — the one model whose NAME advertises vision
+// ("5V") is the one that answers "I am unable to view or analyze images",
+// which is exactly why capability is measured and never inferred from a name.
+// `glm-4.7` stays text-only because the gateway answers HTTP 400 "service info
+// not found" for it.
+const TEXT_ONLY_MODEL_IDS = new Set([
+  'glm-5v-turbo',
+  'glm-4.7',
+])
+
 const DEFAULT_MODELS = [
   { id: 'hy3', name: 'CodeBuddy-Hy3' },
   { id: 'glm-5.2', name: 'CodeBuddy-GLM-5.2' },
@@ -72,7 +115,17 @@ const DEFAULT_MODELS = [
   { id: 'deepseek-v4.1-flash', name: 'CodeBuddy-V4.1-Flash' },
   { id: 'deepseek-v4-flash', name: 'CodeBuddy-V4-Flash' },
   { id: 'deepseek-v3-2-volc', name: 'CodeBuddy-V3.2-Volc' },
-].map(model => ({ ...model, contextWindow: DEFAULT_CONTEXT_WINDOW }))
+].map(model => ({
+  ...model,
+  contextWindow: DEFAULT_CONTEXT_WINDOW,
+  // Explicit on every shipped entry, so a connection-level `defaultInput` only
+  // governs models the user adds or overrides. Measured vision is the default
+  // here; the deny-list carries the exceptions.
+  inputModalities: TEXT_ONLY_MODEL_IDS.has(model.id) ? ['text'] : ['text', 'image'],
+}))
+
+/** Modality vocabulary accepted in `inputModalities` and `defaultInput`. */
+const MODALITIES = ['text', 'image']
 
 /**
  * Plugin config, validated by the same-named schemastery schema and doubling
@@ -91,6 +144,9 @@ const DEFAULT_MODELS = [
  * @property {number} [maxTokens] - Default per-request output cap (default 4,096).
  * @property {number} [defaultContextWindow] - Positive context capacity used when the selected model has no exact value.
  * @property {Array} [models] - Advisory models shown by discovery consumers.
+ * @property {string[]} [defaultInput] - Modalities for catalog models that declare none (default `['text']`).
+ * @property {number} [imagePixelBudget] - Default total-pixel cap for one model-request image (default 640,000).
+ * @property {number} [imageMaxBytes] - Default encoded-byte target for one model-request image (default 1 MiB).
  * @property {number} [streamIdleTimeoutMs] - Maximum provider idle time while one stream read is outstanding.
  * @property {object} [retryPolicy] - Provider-owned model-request retry policy.
  */
@@ -101,6 +157,13 @@ const catalogModel = z.object({
   description: z.string(),
   contextWindow: z.number().step(1).min(1),
   maxTokens: z.number().step(1).min(1),
+  // Per-model vision capability. Deliberately NO `.min(1)`: Schemastery
+  // materializes an absent key as `[]`, and `[]` must mean "unspecified, use
+  // `defaultInput`" rather than a schema failure. This mirrors the upstream
+  // pi-ai catalog's own `input` field, which reads empty the same way.
+  inputModalities: z.array(z.union(MODALITIES)),
+  imagePixelBudget: z.number().step(1).min(1),
+  imageMaxBytes: z.number().step(1).min(1),
 })
 
 export const Config = z.object({
@@ -112,6 +175,9 @@ export const Config = z.object({
   maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
   defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
   models: z.array(catalogModel).default(DEFAULT_MODELS),
+  defaultInput: z.array(z.union(MODALITIES)).default(['text']),
+  imagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET),
+  imageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema,
 })
@@ -136,9 +202,25 @@ export function defaultWorkbuddyTokenPath() {
   return join(base, WORKBUDDY_TOKEN_FILE_RELATIVE)
 }
 
-/** Resolve, validate, and detach the advisory model catalog. */
-function resolveModels(models) {
+/**
+ * Resolve, validate, and detach the advisory model catalog.
+ *
+ * Modalities resolve per model in this order: the entry's own
+ * `inputModalities`, else the connection-level `defaultInput`, else
+ * `['text']`. The default is deliberately text-only — claiming image input a
+ * model does not have is far worse than omitting it, because the provider then
+ * silently hallucinates a description of an image it never received.
+ *
+ * @param models - raw catalog entries, or undefined to use the built-in catalog.
+ * @param defaultInput - connection-level modality fallback for entries that declare none.
+ * @returns detached catalog entries carrying validated image capability and request budgets.
+ */
+function resolveModels(models, defaultInput = ['text']) {
   const seen = new Set()
+  const fallback = [...defaultInput]
+  if (fallback.length === 0) {
+    throw new Error('llm-codebuddy: defaultInput must name at least one modality')
+  }
   return (models ?? DEFAULT_MODELS).map((model) => {
     if (model.id.length === 0) throw new Error('llm-codebuddy: catalog model ids must be non-empty')
     if (model.name !== undefined && model.name.length === 0) {
@@ -156,6 +238,47 @@ function resolveModels(models) {
         `llm-codebuddy: catalog model "${model.id}" maxTokens must be a positive integer`,
       )
     }
+    // An absent OR empty list means "unspecified": Schemastery materializes a
+    // missing key as `[]`, and an explicit `[]` reads the same way, exactly as
+    // the upstream pi-ai catalog's `input` field does. Only a list with real
+    // members is treated as a declaration.
+    const declared = model.inputModalities
+    const inputModalities = declared === undefined || declared.length === 0
+      ? [...fallback]
+      : [...declared]
+    if (inputModalities.length === 0) {
+      throw new Error(`llm-codebuddy: catalog model "${model.id}" inputModalities must not be empty`)
+    }
+    for (const modality of inputModalities) {
+      if (!MODALITIES.includes(modality)) {
+        throw new Error(
+          `llm-codebuddy: catalog model "${model.id}" inputModalities must contain only "text" and "image"`,
+        )
+      }
+    }
+    if (new Set(inputModalities).size !== inputModalities.length) {
+      throw new Error(`llm-codebuddy: catalog model "${model.id}" inputModalities must not contain duplicates`)
+    }
+    const hasImage = inputModalities.includes('image')
+    // A text-only model cannot carry image request limits: the host would never
+    // send it an image, so the limits would be dead config that reads as intent.
+    if (!hasImage && (model.imagePixelBudget !== undefined || model.imageMaxBytes !== undefined)) {
+      throw new Error(
+        `llm-codebuddy: text-only catalog model "${model.id}" cannot declare image request limits`,
+      )
+    }
+    if (model.imagePixelBudget !== undefined
+      && (!Number.isSafeInteger(model.imagePixelBudget) || model.imagePixelBudget <= 0)) {
+      throw new Error(
+        `llm-codebuddy: catalog model "${model.id}" imagePixelBudget must be a positive safe integer`,
+      )
+    }
+    if (model.imageMaxBytes !== undefined
+      && (!Number.isSafeInteger(model.imageMaxBytes) || model.imageMaxBytes <= 0)) {
+      throw new Error(
+        `llm-codebuddy: catalog model "${model.id}" imageMaxBytes must be a positive safe integer`,
+      )
+    }
     if (seen.has(model.id)) throw new Error(`llm-codebuddy: duplicate catalog model "${model.id}"`)
     seen.add(model.id)
     return {
@@ -164,6 +287,8 @@ function resolveModels(models) {
       ...(model.description === undefined ? {} : { description: model.description }),
       ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
       ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+      inputModalities,
+      ...(hasImage ? { imagePixelBudget: model.imagePixelBudget, imageMaxBytes: model.imageMaxBytes } : {}),
     }
   })
 }
@@ -198,6 +323,14 @@ export function resolveAdapterOptions(config) {
       `llm-codebuddy: streamIdleTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`,
     )
   }
+  const imagePixelBudget = config.imagePixelBudget ?? DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET
+  if (!Number.isSafeInteger(imagePixelBudget) || imagePixelBudget <= 0) {
+    throw new Error('llm-codebuddy: imagePixelBudget must be a positive safe integer')
+  }
+  const imageMaxBytes = config.imageMaxBytes ?? DEFAULT_REQUEST_IMAGE_MAX_BYTES
+  if (!Number.isSafeInteger(imageMaxBytes) || imageMaxBytes <= 0) {
+    throw new Error('llm-codebuddy: imageMaxBytes must be a positive safe integer')
+  }
   return {
     endpoint: config.endpoint ?? DEFAULT_ENDPOINT,
     tokenPath: config.tokenPath ?? defaultTokenPath(),
@@ -208,7 +341,9 @@ export function resolveAdapterOptions(config) {
     },
     maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
     defaultContextWindow: config.defaultContextWindow ?? DEFAULT_CONTEXT_WINDOW,
-    models: resolveModels(config.models),
+    models: resolveModels(config.models, config.defaultInput),
+    imagePixelBudget,
+    imageMaxBytes,
     streamIdleTimeoutMs,
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-codebuddy: retryPolicy'),
   }
@@ -303,7 +438,26 @@ export function apply(ctx, config) {
     }
   }
 
-  const adapter = new CodeBuddyAdapter({ options, resolveSession })
+  // The durable attachment service owns image bytes: the session log keeps
+  // content-addressed references, and only this seam can turn one into the
+  // normalized request bytes a provider receives. Resolved lazily per request
+  // (like the endpoint) so mounting order cannot freeze a missing service, and
+  // `undefined` when no backend is mounted — the access resolver must not be
+  // called with a missing store, it dereferences the provider.
+  const adapter = new CodeBuddyAdapter({
+    options,
+    resolveSession,
+    resolveAttachments: () => ctx.get('attachments'),
+    resolveImageAccess: (ref) => {
+      const attachments = ctx.get('attachments')
+      if (attachments === undefined) return undefined
+      return resolveImageAttachmentAccess(
+        attachments,
+        hostPath => ctx.get('fs')?.processPathFromHostPath(hostPath),
+        ref,
+      )
+    },
+  })
   ctx.llm.registerConfigurableProviders([
     { provider: PROVIDER, displayName: 'CodeBuddy', settingsNs: NS, settingsPath: [] },
   ])

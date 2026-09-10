@@ -11,14 +11,21 @@
 
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
+  contentHasImage,
   isContextWindowExceededError,
   isQuotaExceededError,
   LlmAdapter,
   LlmError,
+  offloadRequestImagesWithPolicy,
+  offloadedImagePrefixCount,
+  offloadedImageText,
   ProviderRequestId,
   QUOTA_EXCEEDED_CODE,
   ReasoningEffortId,
+  requestImageHandleText,
+  textOnlyImageText,
 } from '@deepseek-ai/dsh-llm'
+import { requestImageDimensions } from '@deepseek-ai/dsh-attachment'
 import { idleWatchdog, timeoutOf } from '@deepseek-ai/dsh-timeout'
 import { serializeRequest } from './serialize.js'
 import { parseSse } from './sse.js'
@@ -30,6 +37,17 @@ export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 export const DEFAULT_CONTEXT_WINDOW = 1_000_000
 /** Default per-request output-token cap, matching the reference chat client. */
 export const DEFAULT_MAX_TOKENS = 4_096
+/** Total-pixel budget for one model-request image. */
+export const DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET = 640_000
+/** Encoded-byte target for one deterministic model-request image. */
+export const DEFAULT_REQUEST_IMAGE_MAX_BYTES = 1024 * 1024
+/** Bound on accumulated image bytes per request before oldest-first offloading. */
+const MAX_REQUEST_IMAGE_BYTES = 128 * 1024 * 1024
+/** Image-count bound per request, matching the DeepSeek route on the same gateway. */
+const MAX_IMAGES_PER_REQUEST = 600
+/** Oldest-first removal quanta once a request exceeds either bound. */
+const IMAGE_OFFLOAD_BYTE_QUANTUM = 64 * 1024 * 1024
+const IMAGE_OFFLOAD_COUNT_QUANTUM = 20
 const STREAM_IDLE_TIMEOUT_CODE = 'LLM_STREAM_IDLE_TIMEOUT'
 const OFF_REASONING_EFFORT = ReasoningEffortId('off')
 const HIGH_REASONING_EFFORT = ReasoningEffortId('high')
@@ -71,6 +89,8 @@ const OFF_ONLY_REASONING_EFFORTS = [
  * @property {number} maxTokens - Default per-request output cap.
  * @property {number} defaultContextWindow - Context capacity when the model has no exact value.
  * @property {CodeBuddyCatalogModel[]} models - Advisory models exposed to discovery.
+ * @property {number} imagePixelBudget - Default total-pixel budget per model-request image.
+ * @property {number} imageMaxBytes - Default encoded-byte budget per model-request image.
  * @property {number} streamIdleTimeoutMs - Maximum provider idle while one stream read is outstanding.
  * @property {object} retryPolicy - Provider-owned model-request retry policy, already resolved.
  */
@@ -80,6 +100,8 @@ const OFF_ONLY_REASONING_EFFORTS = [
  * @typedef {object} CodeBuddyAdapterOptions
  * @property {() => CodeBuddyConnectionOptions} options - Current validated connection facts; called once per operation.
  * @property {(connection: CodeBuddyConnectionOptions) => Promise<CodeBuddySession>} resolveSession - Resolve the bearer session for one request snapshot.
+ * @property {() => object | undefined} [resolveAttachments] - Current durable attachment service, when the deployment mounts one.
+ * @property {(ref: object) => object | undefined} [resolveImageAccess] - Resolve one image reference's execution-world access for its model-facing handle text.
  */
 
 function modelInfo(provider, model) {
@@ -88,7 +110,60 @@ function modelInfo(provider, model) {
     id: model.id,
     name: model.name ?? model.id,
     ...(model.description === undefined ? {} : { description: model.description }),
-    inputModalities: ['text'],
+    // Per-model, measured capability. Declaring `['text']` for every model was
+    // what made the host refuse an image before the request was ever built;
+    // declaring `image` for a model that only *accepts* the part is worse,
+    // because the provider then hallucinates a description of an image it
+    // never received.
+    inputModalities: [...(model.inputModalities ?? ['text'])],
+  }
+}
+
+/** Resolve the request-image pixel/byte budgets for one catalog model. */
+function resolveImagePolicy(connection, model) {
+  return {
+    maxPixels: model?.imagePixelBudget ?? connection.imagePixelBudget,
+    maxBytes: model?.imageMaxBytes ?? connection.imageMaxBytes,
+  }
+}
+
+/**
+ * Collect every durable image occurrence in a request, in request order.
+ * Tool-result content is walked because a tool (a screenshot reader, say) can
+ * return an image nested inside a result.
+ * @param content - one message's content blocks.
+ * @param refs - insertion-ordered map keyed by attachment id, deduplicating occurrences of the same image.
+ */
+function collectImageRefs(content, refs) {
+  for (const block of content) {
+    if (block.type === 'image') refs.set(block.attachment.attachmentId, block.attachment)
+    else if (block.type === 'tool-result') collectImageRefs(block.content, refs)
+  }
+}
+
+/**
+ * Derive the deterministic model-request version of every image in the call.
+ * One version per distinct attachment id serves every occurrence, and the
+ * result is what both the serializer and the pricing path read.
+ * @param options - the harness request about to be serialized.
+ * @param connection - validated connection facts carrying the byte budgets.
+ * @param model - the catalog entry for the exact model, when it is advertised.
+ * @param attachments - the durable attachment service.
+ * @param resolveImageAccess - execution-world access resolver for the handle text.
+ * @param signal - cancellation for image decode and re-encode work.
+ * @returns prepared request versions plus the execution-world access resolver.
+ */
+async function prepareRequestImages(options, connection, model, attachments, resolveImageAccess, signal) {
+  const refs = new Map()
+  for (const message of options.messages) collectImageRefs(message.content, refs)
+  const policy = resolveImagePolicy(connection, model)
+  const ordered = [...refs.values()]
+  const projected = await Promise.all(
+    ordered.map(ref => attachments.readImageRequest(ref, policy, signal)),
+  )
+  return {
+    requestImages: new Map(ordered.map((ref, index) => [ref.attachmentId, projected[index]])),
+    resolveAccess: ref => resolveImageAccess?.(ref),
   }
 }
 
@@ -151,6 +226,52 @@ export class CodeBuddyAdapter extends LlmAdapter {
     return this.config.options().retryPolicy
   }
 
+  /**
+   * Price image occurrences for the token meter, synchronously and without I/O.
+   * The meter calls this per measurement, so it must reproduce the serializer's
+   * decision from durable metadata alone: an image-capable model is priced by
+   * its projected request dimensions, and a text-only model by the identical
+   * deterministic placeholder the text projection substitutes, so the estimate
+   * never claims visual tokens the request will not spend.
+   * @param provider - the `codebuddy` route.
+   * @param model - exact model id named by the request.
+   * @returns per-occurrence pricing for this route.
+   */
+  imageRequestPricing(_provider, model) {
+    const connection = this.config.options()
+    const configured = connection.models.find(entry => entry.id === model)
+    if (configured?.inputModalities?.includes('image') !== true) {
+      return { priceImages: images => images.map(ref => ({ visualTokens: 0, text: textOnlyImageText(ref) })) }
+    }
+    const policy = resolveImagePolicy(connection, configured)
+    const resolveAccess = this.config.resolveImageAccess
+    return {
+      priceImages: images => {
+        const offloaded = offloadedImagePrefixCount(
+          images.map(ref => Math.min(ref.bytes, policy.maxBytes)),
+          {
+            maxBytes: MAX_REQUEST_IMAGE_BYTES,
+            maxImages: MAX_IMAGES_PER_REQUEST,
+            byteQuantum: IMAGE_OFFLOAD_BYTE_QUANTUM,
+            countQuantum: IMAGE_OFFLOAD_COUNT_QUANTUM,
+          },
+        )
+        return images.map((ref, index) => {
+          if (index < offloaded) {
+            return { visualTokens: 0, text: offloadedImageText(ref, resolveAccess?.(ref)) }
+          }
+          const dimensions = requestImageDimensions(ref.width, ref.height, policy.maxPixels)
+          return {
+            // The gateway discloses no visual-token formula; the area-based
+            // divisor is the conservative conventional estimate.
+            visualTokens: Math.ceil((dimensions.width * dimensions.height) / 750),
+            text: requestImageHandleText(ref, dimensions, resolveAccess?.(ref)),
+          }
+        })
+      },
+    }
+  }
+
   listModels(provider) {
     return Promise.resolve(this.config.options().models.map(model => modelInfo(provider, model)))
   }
@@ -161,10 +282,11 @@ export class CodeBuddyAdapter extends LlmAdapter {
     const contextWindow = configured?.contextWindow
       ?? connection.defaultContextWindow
     return Promise.resolve({
-      // The chat-completions wire route is text-only regardless of catalog
-      // membership, so the uncatalogued fallback declares the same negative
-      // capability — "unknown" here would let the host accept and persist
-      // images the serializer must then reject.
+      // An uncatalogued model declares text-only. Image acceptance is not
+      // capability here — the gateway takes an image part for every model and a
+      // text-only one then hallucinates a description — so "unknown" must not
+      // mean "assume vision": that would accept and persist images the provider
+      // cannot actually read.
       ...(configured === undefined
         ? { provider, id: model, name: model, inputModalities: ['text'] }
         : modelInfo(provider, configured)),
@@ -246,7 +368,41 @@ export class CodeBuddyAdapter extends LlmAdapter {
   }
 
   async * request(options, signal, connection, session, onComment) {
-    const body = serializeRequest(options, connection.defaults)
+    const model = connection.models.find(entry => entry.id === options.model)
+    const acceptsImages = model?.inputModalities?.includes('image') === true
+    // The host already gates image admission on the declared modality and
+    // projects images away for a text-only route, so an image reaching a
+    // text-only model here means the route changed under a live request. Fail
+    // loudly: silently dropping it would answer a question about an image the
+    // model never saw, which is the exact failure this capability work exists
+    // to prevent.
+    if (!acceptsImages && options.messages.some(message => contentHasImage(message.content))) {
+      throw new LlmError(
+        `CodeBuddy model "${options.model}" is not configured to accept image input.`,
+        'UNSUPPORTED_CONTENT',
+      )
+    }
+    const requestOptions = acceptsImages
+      ? { ...options, messages: offloadRequestImagesWithPolicy(options.messages, {
+          representation: 'base64',
+          maxBytes: MAX_REQUEST_IMAGE_BYTES,
+          maxImages: MAX_IMAGES_PER_REQUEST,
+          byteQuantum: IMAGE_OFFLOAD_BYTE_QUANTUM,
+          countQuantum: IMAGE_OFFLOAD_COUNT_QUANTUM,
+          placeholder: ref => offloadedImageText(ref, this.config.resolveImageAccess?.(ref)),
+        }) }
+      : options
+    const images = acceptsImages && this.config.resolveAttachments !== undefined
+      ? await prepareRequestImages(
+          requestOptions,
+          connection,
+          model,
+          this.config.resolveAttachments(),
+          this.config.resolveImageAccess,
+          signal,
+        )
+      : undefined
+    const body = serializeRequest(requestOptions, connection.defaults, images)
     // Prepared outside the try so the TRANSPORT label below covers exactly the
     // transport boundary, never a serialization failure.
     const payload = JSON.stringify(body)
