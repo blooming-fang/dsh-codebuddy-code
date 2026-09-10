@@ -28,7 +28,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { assertUsableApiKey, LlmError, resolveRetryPolicy, RetryPolicySchema } from '@deepseek-ai/dsh-llm'
-import { deepEqualJson, installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import { deepEqualJson } from '@deepseek-ai/dsh-util-values'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import {
   CodeBuddyAdapter,
@@ -40,7 +40,7 @@ import {
 export const name = 'llm-codebuddy'
 export const inject = ['llm']
 
-const NS = settingsNamespace('llm-codebuddy')
+const NS = 'llm-codebuddy'
 /** The single provider route this plugin owns. */
 export const PROVIDER = 'codebuddy'
 /** Environment overrides, in preference order, matching the reference chat client. */
@@ -69,6 +69,7 @@ const DEFAULT_MODELS = [
   { id: 'kimi-k2.6', name: 'CodeBuddy-Kimi-K2.6' },
   { id: 'kimi-k2.5', name: 'CodeBuddy-Kimi-K2.5' },
   { id: 'deepseek-v4-pro', name: 'CodeBuddy-V4-Pro' },
+  { id: 'deepseek-v4.1-flash', name: 'CodeBuddy-V4.1-Flash' },
   { id: 'deepseek-v4-flash', name: 'CodeBuddy-V4-Flash' },
   { id: 'deepseek-v3-2-volc', name: 'CodeBuddy-V3.2-Volc' },
 ].map(model => ({ ...model, contextWindow: DEFAULT_CONTEXT_WINDOW }))
@@ -322,10 +323,12 @@ export function apply(ctx, config) {
     registeredPolicy = policy
   }
 
-  installSettingsSection(ctx, NS, Config, config, {
-    setSource: (source) => {
-      current = source
-    },
-    onChange: ensureRegistrationFacts,
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, NS, Config, config, {
+      setSource: (source) => {
+        current = source
+      },
+      onChange: ensureRegistrationFacts,
+    })
   })
 }

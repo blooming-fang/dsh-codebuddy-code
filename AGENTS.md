@@ -68,11 +68,11 @@ The retry policy is captured at registration, so it is the one fact per-request 
 
 The `llm-codebuddy:` settings namespace (`$DSH_HOME/settings.yaml`) doubles as the plugin config schema and is installable via `installSettingsSection`. Every field is optional; changes reach the next request without restarting. Key fields: `endpoint` (default `https://copilot.tencent.com/v2/chat/completions`), `tokenPath`, `workbuddyTokenPath` (fallback WorkBuddy login document), `thinking` (`enabled`/`disabled`), `reasoningEffort` (`off`/`high`/`max`, default `off`), `maxTokens` (default 4096), `defaultContextWindow` (default 1000000), `models` (advisory catalog), `streamIdleTimeoutMs` (default 300000), `retryPolicy`.
 
-The advisory `models` catalog (mirroring the CodeBuddy CLI's `cli` agent list: `glm-5.x`, `kimi-k3-1`/`kimi-k2.x`, `minimax-m3`/`minimax-m2.7`, `hy3`, `deepseek-v4-pro`/`deepseek-v4-flash`, `deepseek-v3-2-volc`) is what discovery shows; it does not restrict which wire model ids are accepted. `resolveModel` accepts any model id, falling back to `defaultContextWindow`/`maxTokens`.
+The advisory `models` catalog (mirroring the CodeBuddy CLI's `cli` agent list: `glm-5.x`, `kimi-k3-1`/`kimi-k2.x`, `minimax-m3`/`minimax-m2.7`, `hy3`, `deepseek-v4-pro`/`deepseek-v4.1-flash`/`deepseek-v4-flash`, `deepseek-v3-2-volc`) is what discovery shows; it does not restrict which wire model ids are accepted. `resolveModel` accepts any model id, falling back to `defaultContextWindow`/`maxTokens`.
 
 ## Dependencies and closure
 
-All dependencies are peers on the installed dsh's in-closure runtime and resolve to the same instance via the profile's module fallback; no `pnpm install` is needed after `dsh plugin add`. Peers: `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-settings`, `@deepseek-ai/dsh-timeout`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/cordis`, plus runtime deps `@deepseek-ai/schemastery` and `eventsource-parser`. Keep peer ranges aligned with the installed dsh minor (currently `^0.1.0-rc.2 || ^0.1.1-rc.1`).
+All dependencies are peers on the installed dsh's in-closure runtime and resolve to the same instance via the profile's module fallback; no `pnpm install` is needed after `dsh plugin add`. Peers: `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-settings`, `@deepseek-ai/dsh-timeout`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-util-values`, `@deepseek-ai/cordis`, plus runtime deps `@deepseek-ai/schemastery` and `eventsource-parser`. Keep peer ranges aligned with the installed dsh minor (currently `^0.1.5-rc.1`).
 
 ## cordis.patch.yml
 
