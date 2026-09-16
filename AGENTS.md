@@ -35,9 +35,12 @@ dsh-codebuddy-code/
 │   ├── translate.js   # wire chunk → harness StreamChunk
 │   ├── sse.js         # SSE byte stream → data payloads (eventsource-parser)
 │   └── types.js       # wire-format documentation (no runtime code)
+├── tests/
+│   └── image-support.test.mjs # offline regressions: modalities, serializer, durable offload
 └── scripts/
     ├── check-pack.mjs # prepack gate: bundle completeness before npm pack/publish
-    └── cb-proxy.mjs   # local capture proxy for diagnosing tool-call failures
+    ├── cb-proxy.mjs   # local capture proxy for diagnosing tool-call failures
+    └── vision-probe.mjs # live per-model image-capability measurement (the catalog's source)
 ```
 
 Each `src/*.js` module is the direct port of the matching `packages/llm/llm-codebuddy/src/*.ts`. A module's docstring names its TS source-of-truth twin.
@@ -57,6 +60,7 @@ These are hard-won gateway behaviors. Reverting any of them breaks real requests
   - **Use a generous `max_tokens` (400).** Several models emit the real answer only after a long `reasoning_content` preamble even with thinking disabled. A tight cap truncated answers to `""` and made seeing models (`glm-5.0-turbo`, `kimi-k2.7`, `minimax-m2.7`, `deepseek-v3-2-volc`, `hy3`) look text-only.
   - The no-image **control must fail** for a VISION verdict; `--trials=N` (default 1, use ≥3) repeats on fresh layouts because a borderline model can flip between runs.
 - **An image must never be silently dropped.** `serialize.js` rejects image content in a non-user role (`UNSUPPORTED_CONTENT`) and throws when an image has no prepared request version, instead of letting the text join erase it. A request that reaches a text-only route with an image also fails loud rather than dispatching. Answering about an image the model never saw is the failure mode this guards.
+- **Request-image offloading is a DURABLE session decision, never the adapter's own.** dsh `0.1.6-alpha.1` replaced `offloadRequestImagesWithPolicy`/`offloadedImagePrefixCount` with `requiredImageOffload` + `projectOffloadedImages`: the adapter prepares the retained versions and, when `requiredImageOffload` reports an over-budget count, throws `LlmError(..., IMAGE_OFFLOAD_REQUIRED_CODE, { offloadImages })` instead of dropping anything. `dsh-compaction-image-offload` then appends an `image/offload` event on the session surface and retries, after which `projectOffloadedImages` substitutes `offloadedImageText` for exactly those occurrences — on every route and every replay. Accordingly `collectImageRefs` skips blocks already marked `offloaded`, and `imageRequestPricing` prices the durable `offloaded` mark per block (`priceImages` now receives `ImageBlock[]`, not attachment refs). Recomputing a prefix count there, or offloading inside `request()`, reintroduces a per-request omission the session log never records — exactly the asymmetry this seam removed. The attachment seam changed in the same release: `attachments.readImageRequest(ref, target, signal)` takes an exact `{ width, height, maxBytes }` target (`requestImageDimensions(ref.width, ref.height, maxPixels)` plus the byte target), not the old `{ maxPixels, maxBytes }` policy object.
 - **`inputModalities` in the catalog schema has no `.min(1)`.** Schemastery materializes an absent key as `[]`, and `[]` must mean "unspecified, inherit `defaultInput`" — matching the upstream pi-ai `input` field. Adding `.min(1)` makes every entry that omits the key fail schema resolution.
 - **`user` tool results** (harness vocabulary) become standalone `role: 'tool'` wire messages; empty tool output is sent as `'(no output)'` so the wire always carries content.
 - **Do not add runtime validation at typed same-process boundaries** for values the static interfaces guarantee; validate in `resolveAdapterOptions` (the one explicit resolve step) and at wire boundaries.
@@ -71,13 +75,13 @@ The retry policy is captured at registration, so it is the one fact per-request 
 
 ## Settings section
 
-The `llm-codebuddy:` settings namespace (`$DSH_HOME/settings.yaml`) doubles as the plugin config schema and is installable via `installSettingsSection`. Every field is optional; changes reach the next request without restarting. Key fields: `endpoint` (default `https://copilot.tencent.com/v2/chat/completions`), `tokenPath`, `workbuddyTokenPath` (fallback WorkBuddy login document), `thinking` (`enabled`/`disabled`), `reasoningEffort` (`off`/`high`/`max`, default `off`), `maxTokens` (default 4096), `defaultContextWindow` (default 1000000), `models` (advisory catalog), `streamIdleTimeoutMs` (default 300000), `retryPolicy`.
+The `llm-codebuddy:` settings namespace (`$DSH_HOME/settings.yaml`) doubles as the plugin config schema and is installable via `installSettingsSection`. Every field is optional; changes reach the next request without restarting. Key fields: `endpoint` (default `https://copilot.tencent.com/v2/chat/completions`), `tokenPath`, `workbuddyTokenPath` (fallback WorkBuddy login document), `thinking` (`enabled`/`disabled`), `reasoningEffort` (`off`/`high`/`max`, default `off`), `maxTokens` (default 384000), `defaultContextWindow` (default 1000000), `models` (advisory catalog), `streamIdleTimeoutMs` (default 300000), `retryPolicy`.
 
 The advisory `models` catalog (mirroring the CodeBuddy CLI's `cli` agent list: `glm-5.x`, `kimi-k3-1`/`kimi-k2.x`, `minimax-m3`/`minimax-m2.7`, `hy3`, `deepseek-v4-pro`/`deepseek-v4.1-flash`/`deepseek-v4-flash`, `deepseek-v3-2-volc`) is what discovery shows; it does not restrict which wire model ids are accepted. `resolveModel` accepts any model id, falling back to `defaultContextWindow`/`maxTokens`.
 
 ## Dependencies and closure
 
-All dependencies are peers on the installed dsh's in-closure runtime and resolve to the same instance via the profile's module fallback; no `pnpm install` is needed after `dsh plugin add`. Peers: `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-settings`, `@deepseek-ai/dsh-timeout`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-util-values`, `@deepseek-ai/cordis`, plus runtime deps `@deepseek-ai/schemastery` and `eventsource-parser`. Keep peer ranges aligned with the installed dsh minor (currently `^0.1.5-rc.1`).
+All dependencies are peers on the installed dsh's in-closure runtime and resolve to the same instance via the profile's module fallback; no `pnpm install` is needed after `dsh plugin add`. Peers: `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-attachment`, `@deepseek-ai/dsh-settings`, `@deepseek-ai/dsh-timeout`, `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-util-values`, `@deepseek-ai/cordis`, plus runtime deps `@deepseek-ai/schemastery` and `eventsource-parser`. Keep peer ranges aligned with the installed dsh minor (currently `^0.1.6-alpha.1` — the release that replaced the per-request image-offload helper with the durable `requiredImageOffload`/`projectOffloadedImages` pair and moved `readImageRequest` to an exact request target).
 
 ## cordis.patch.yml
 
@@ -95,13 +99,19 @@ The bundle layer inserts exactly one plugin row:
 
 ```sh
 # pack (runs check-pack via prepack)
-cd plugins/dsh-codebuddy-code && npm pack     # -> dsh-codebuddy-code-0.1.0.tgz
+cd plugins/dsh-codebuddy-code && npm pack     # -> dsh-codebuddy-code-0.3.2.tgz
 
 # install into the real web profile (from the parent dir or by tgz path)
 dsh plugin --profile web add D:\path\to\dsh-codebuddy-code          # from source dir
-dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.1.0.tgz
+dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.3.2.tgz
 dsh plugin --profile web remove dsh-codebuddy-code                   # removes deps + layer
 # restart `dsh web` after install/remove
+```
+
+A version bump is required for a reinstall to take effect: the profile's `package.json` pins the tarball by path, and pnpm keeps the already-extracted copy when the version is unchanged. The regression suite runs from the INSTALLED copy (peer resolution needs the profile's module fallback), not from a bare source checkout:
+
+```sh
+cd $DSH_HOME/profiles/web/node_modules/dsh-codebuddy-code && node tests/image-support.test.mjs
 ```
 
 Publishing config is present in `package.json` (`publishConfig.access: public`, git repo URLs). **Do not actually `npm publish`** unless explicitly requested — this repo only ships the configuration. Never commit `.tgz` or `node_modules` (both gitignored); `.npmignore` additionally excludes `scripts/`, `.git/`, `.github/`, `*.log`.

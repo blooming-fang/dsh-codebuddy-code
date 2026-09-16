@@ -36,6 +36,14 @@ dsh-codebuddy-code/
 
 本包是 `packages/llm/llm-codebuddy`（workspace TypeScript，rc.5）的**自包含 JS 移植**，面向已安装的 dsh。若你从源码 checkout 跑 dsh，用 workspace 包即可；这里的内嵌版本与已安装 dsh 完全兼容，不需要发布或构建 workspace 包。
 
+**版本要求：dsh `0.1.6-alpha.1` 及以上（插件 0.3.1 起）。** dsh `0.1.6-alpha.1` 把「请求级图片裁剪」换成了「会话级持久化裁剪」：`@deepseek-ai/dsh-llm` 不再导出 `offloadRequestImagesWithPolicy` / `offloadedImagePrefixCount`，改为 `requiredImageOffload` + `projectOffloadedImages`，`attachments.readImageRequest` 也从 `{ maxPixels, maxBytes }` 策略对象改为精确的 `{ width, height, maxBytes }` 目标。0.3.0 及更早的插件仍引用旧 API，在这种 dsh 上**启动即崩溃**：
+
+```
+SyntaxError: The requested module '@deepseek-ai/dsh-llm' does not provide an export named 'offloadRequestImagesWithPolicy'
+```
+
+升级方式见下方「安装」。
+
 ## 安装
 
 需要一个已初始化的 web profile。从 npm 安装（已发布）：
@@ -55,10 +63,23 @@ dsh plugin --profile web add dsh-codebuddy-code
 ```sh
 cd plugins/dsh-codebuddy-code
 npm pack
-# 生成 dsh-codebuddy-code-0.1.0.tgz
+# 生成 dsh-codebuddy-code-0.3.2.tgz
 ```
 
-该包所有依赖（`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-settings`、`@deepseek-ai/dsh-timeout`、`@deepseek-ai/dsh-invariants`、`@deepseek-ai/cordis`、`@deepseek-ai/schemastery`、`eventsource-parser`）都已在已安装 dsh 的 profile 依赖闭包 / module fallback 里，bundle 以 peer 直接依赖的形式解析到同一实例，无需额外 `pnpm install`。
+该包所有依赖（`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-attachment`、`@deepseek-ai/dsh-settings`、`@deepseek-ai/dsh-timeout`、`@deepseek-ai/dsh-invariants`、`@deepseek-ai/cordis`、`@deepseek-ai/schemastery`、`eventsource-parser`）都已在已安装 dsh 的 profile 依赖闭包 / module fallback 里，bundle 以 peer 直接依赖的形式解析到同一实例，无需额外 `pnpm install`。
+
+已装过旧版时**必须带版本号升级**：profile 的 `package.json` 按路径钉住 tgz，版本号不变时 pnpm 会继续使用已解包的旧副本。升级后重启 `dsh web`：
+
+```sh
+cd plugins/dsh-codebuddy-code && npm pack                                  # 0.3.2
+dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.3.2.tgz
+```
+
+离线回归测试要在**已安装的 profile 副本**里跑（peer 依赖只能靠 profile 的 module fallback 解析）：
+
+```sh
+cd $DSH_HOME/profiles/web/node_modules/dsh-codebuddy-code && node tests/image-support.test.mjs
+```
 
 ## 配置
 
@@ -71,7 +92,7 @@ llm-codebuddy:
   workbuddyTokenPath: C:\Users\you\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info  # 可选，CodeBuddy 未登录时回退
   thinking: enabled                  # enabled | disabled（默认 disabled）
   reasoningEffort: off               # off | high | max（默认 off）
-  maxTokens: 4096                    # 默认 4096
+  maxTokens: 384000                  # 单次输出上限，默认 384000（384K）
   defaultContextWindow: 1000000      # 默认 1000000
   defaultInput:                      # 给「未声明 inputModalities」的模型用的模态兜底（默认 [text]）
     - text
@@ -133,6 +154,7 @@ llm-codebuddy:
 - **实测结论与直觉相反：这个网关上「能看图」是常态，「纯文本」才是例外**，所以目录用的是一份很短的 `TEXT_ONLY_MODEL_IDS` 黑名单。唯一的例外是 `glm-5v-turbo`——**名字里唯一带 "V"（视觉）的那个模型，恰恰是唯一不能看图的**，它回答 "I am unable to view or analyze images"。想看全部实测结果或新增模型，运行 `node scripts/vision-probe.mjs --trials=3`。
 - 探测脚本有两处「踩过坑」的设计，改动前请注意：①**每轮打乱四象限布局并按位置判分**——早先固定问「红绿蓝黄」，纯文本模型直接照猜这个标准顺序，好几个对照组盲猜 4/4；②**`max_tokens` 给足（400）**——有些模型即使关闭 thinking 也会先吐一大段 `reasoning_content`，上限太小会把真正的答案截成空字符串，导致有视觉的模型被误判成纯文本。
 - 图片只允许出现在 user 消息里；出现在 system/assistant 消息会以 `UNSUPPORTED_CONTENT` 明确拒绝，而不会被文本拼接悄悄丢掉。
+- **请求图片超限时，适配器不自己丢图，而是要求会话级「持久裁剪」。** 超出预算（累计 128 MiB base64 / 600 张）时适配器抛 `IMAGE_OFFLOAD_REQUIRED`（带 `offloadImages` 计数），由 dsh 的 `dsh-compaction-image-offload` 在会话上追加一条 `image/offload` 决定并重试；重试时 `projectOffloadedImages` 把这些图片换成占位文本（`image omitted to fit request image limits`），此后所有路由与历史重放都一致。**不要**改回「适配器在单次请求里自己裁剪」——那是 dsh 0.1.5 的旧语义，裁剪只存在于那一次请求里，会话日志没有记录，重放时两边不一致。
 - `reasoning_effort: 'off'` 是合法 harness 值，但被网关以 HTTP 400 拒绝，故适配器把 `off` 映射为 `thinking: { type: 'disabled' }`，从不发送该字段。
 - 无 `stop` 语义差异遵循 OpenAI 兼容；`stream_options` 不发（网关在 finish chunk 上已附 `usage`）。
 - 推理内容只在带工具调用的轮次被回放为 `reasoning_content`（与 DeepSeek 思维模式一致）。

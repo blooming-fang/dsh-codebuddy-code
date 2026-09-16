@@ -12,17 +12,18 @@
 import {
   CONTEXT_WINDOW_EXCEEDED_CODE,
   contentHasImage,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
   isContextWindowExceededError,
   isQuotaExceededError,
   LlmAdapter,
   LlmError,
-  offloadRequestImagesWithPolicy,
-  offloadedImagePrefixCount,
   offloadedImageText,
+  projectOffloadedImages,
   ProviderRequestId,
   QUOTA_EXCEEDED_CODE,
   ReasoningEffortId,
   requestImageHandleText,
+  requiredImageOffload,
   textOnlyImageText,
 } from '@deepseek-ai/dsh-llm'
 import { requestImageDimensions } from '@deepseek-ai/dsh-attachment'
@@ -35,8 +36,16 @@ import { translate } from './translate.js'
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000
 /** Default combined request/response context capacity. */
 export const DEFAULT_CONTEXT_WINDOW = 1_000_000
-/** Default per-request output-token cap, matching the reference chat client. */
-export const DEFAULT_MAX_TOKENS = 4_096
+/**
+ * Default per-request output-token cap. Deliberately generous: the reference
+ * chat client's own 4,096 truncated real answers that arrive after a long
+ * `reasoning_content` preamble (see the vision-probe note in index.js), so the
+ * default tracks the deployment's own configured budget instead. The gateway
+ * publishes no per-model output limit, so a model with a smaller real cap may
+ * still reject this value — set `llm-codebuddy.maxTokens` or a per-model
+ * `models[].maxTokens` to tighten it for such a route.
+ */
+export const DEFAULT_MAX_TOKENS = 384_000
 /** Total-pixel budget for one model-request image. */
 export const DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET = 640_000
 /** Encoded-byte target for one deterministic model-request image. */
@@ -48,6 +57,20 @@ const MAX_IMAGES_PER_REQUEST = 600
 /** Oldest-first removal quanta once a request exceeds either bound. */
 const IMAGE_OFFLOAD_BYTE_QUANTUM = 64 * 1024 * 1024
 const IMAGE_OFFLOAD_COUNT_QUANTUM = 20
+/**
+ * The retained-image budget this route enforces, in the exact representation it
+ * sends. Exceeding it is never resolved here: the adapter fails with
+ * `IMAGE_OFFLOAD_REQUIRED` naming how many oldest occurrences must go, the
+ * harness's image-offload executor records that decision on the session
+ * surface, and the retried request substitutes placeholder text.
+ */
+const REQUEST_IMAGE_BUDGET = {
+  representation: 'base64',
+  maxBytes: MAX_REQUEST_IMAGE_BYTES,
+  maxImages: MAX_IMAGES_PER_REQUEST,
+  byteQuantum: IMAGE_OFFLOAD_BYTE_QUANTUM,
+  countQuantum: IMAGE_OFFLOAD_COUNT_QUANTUM,
+}
 const STREAM_IDLE_TIMEOUT_CODE = 'LLM_STREAM_IDLE_TIMEOUT'
 const OFF_REASONING_EFFORT = ReasoningEffortId('off')
 const HIGH_REASONING_EFFORT = ReasoningEffortId('high')
@@ -128,41 +151,104 @@ function resolveImagePolicy(connection, model) {
 }
 
 /**
- * Collect every durable image occurrence in a request, in request order.
- * Tool-result content is walked because a tool (a screenshot reader, say) can
- * return an image nested inside a result.
+ * Resolve the exact request projection one durable image gets on this route.
+ * The same target drives both the encoded version the wire carries and the
+ * dimensions the token meter prices, so the estimate can never describe a
+ * different image than the one sent.
+ * @param connection - validated connection facts carrying the defaults.
+ * @param model - the catalog entry for the exact model, when it is advertised.
+ * @param ref - the durable normalized attachment reference.
+ * @returns the attachment service's request target for this route.
+ */
+function resolveRequestImageTarget(connection, model, ref) {
+  const policy = resolveImagePolicy(connection, model)
+  const dimensions = requestImageDimensions(ref.width, ref.height, policy.maxPixels)
+  return { width: dimensions.width, height: dimensions.height, maxBytes: policy.maxBytes }
+}
+
+/**
+ * Collect every RETAINED durable image occurrence in a request, in request
+ * order. Tool-result content is walked because a tool (a screenshot reader,
+ * say) can return an image nested inside a result. An occurrence already marked
+ * `offloaded` is a durable decision every route honors, so it is left to
+ * {@link projectOffloadedImages} instead of being prepared again.
  * @param content - one message's content blocks.
  * @param refs - insertion-ordered map keyed by attachment id, deduplicating occurrences of the same image.
  */
 function collectImageRefs(content, refs) {
   for (const block of content) {
-    if (block.type === 'image') refs.set(block.attachment.attachmentId, block.attachment)
-    else if (block.type === 'tool-result') collectImageRefs(block.content, refs)
+    if (block.type === 'image' && block.offloaded !== true) {
+      refs.set(block.attachment.attachmentId, block.attachment)
+    } else if (block.type === 'tool-result') {
+      collectImageRefs(block.content, refs)
+    }
   }
 }
 
 /**
- * Derive the deterministic model-request version of every image in the call.
- * One version per distinct attachment id serves every occurrence, and the
+ * Refuse a request whose retained occurrences still exceed this route's byte or
+ * count budget at the exact base64 lengths the route sends, naming how many
+ * more oldest retained occurrences must be offloaded first. The adapter never
+ * removes an image on its own: the harness's image-offload executor records the
+ * decision on the session surface and retries, so this request and every later
+ * replay agree on which occurrences became text.
+ * @param messages - derived request history carrying any durable offloaded marks.
+ * @param requestImages - prepared request versions keyed by attachment id.
+ * @throws an `IMAGE_OFFLOAD_REQUIRED` LlmError carrying the additional count.
+ */
+function assertRetainedImagesFit(messages, requestImages) {
+  const offloadImages = requiredImageOffload(messages, REQUEST_IMAGE_BUDGET, (block) => {
+    const version = requestImages.get(block.attachment.attachmentId)
+    if (version === undefined) {
+      throw new LlmError(
+        `CodeBuddy image ${block.attachment.attachmentId} was not prepared for this request.`,
+        'INVALID_REQUEST',
+      )
+    }
+    return version.bytes
+  })
+  if (offloadImages > 0) {
+    throw new LlmError(
+      `CodeBuddy request images exceed the route budget; ${offloadImages} more oldest occurrence(s)`
+      + ' must be offloaded before this request can be sent.',
+      IMAGE_OFFLOAD_REQUIRED_CODE,
+      { offloadImages },
+    )
+  }
+}
+
+/**
+ * Derive the deterministic model-request version of every retained image in the
+ * call. One version per distinct attachment id serves every occurrence, and the
  * result is what both the serializer and the pricing path read.
- * @param options - the harness request about to be serialized.
- * @param connection - validated connection facts carrying the byte budgets.
+ * @param options - the harness request about to be serialized, already projected.
+ * @param connection - validated connection facts carrying the image budgets.
  * @param model - the catalog entry for the exact model, when it is advertised.
  * @param attachments - the durable attachment service.
  * @param resolveImageAccess - execution-world access resolver for the handle text.
  * @param signal - cancellation for image decode and re-encode work.
- * @returns prepared request versions plus the execution-world access resolver.
+ * @returns prepared request versions plus the execution-world access resolver, or
+ *   undefined when the request retains no image.
+ * @throws `UNSUPPORTED_CONTENT` when images are retained with no mounted service.
  */
 async function prepareRequestImages(options, connection, model, attachments, resolveImageAccess, signal) {
   const refs = new Map()
   for (const message of options.messages) collectImageRefs(message.content, refs)
-  const policy = resolveImagePolicy(connection, model)
+  if (refs.size === 0) return undefined
+  if (attachments === undefined) {
+    throw new LlmError(
+      'CodeBuddy image input requires the deployment to mount the durable attachment service.',
+      'UNSUPPORTED_CONTENT',
+    )
+  }
   const ordered = [...refs.values()]
   const projected = await Promise.all(
-    ordered.map(ref => attachments.readImageRequest(ref, policy, signal)),
+    ordered.map(ref => attachments.readImageRequest(ref, resolveRequestImageTarget(connection, model, ref), signal)),
   )
+  const requestImages = new Map(ordered.map((ref, index) => [ref.attachmentId, projected[index]]))
+  assertRetainedImagesFit(options.messages, requestImages)
   return {
-    requestImages: new Map(ordered.map((ref, index) => [ref.attachmentId, projected[index]])),
+    requestImages,
     resolveAccess: ref => resolveImageAccess?.(ref),
   }
 }
@@ -229,10 +315,13 @@ export class CodeBuddyAdapter extends LlmAdapter {
   /**
    * Price image occurrences for the token meter, synchronously and without I/O.
    * The meter calls this per measurement, so it must reproduce the serializer's
-   * decision from durable metadata alone: an image-capable model is priced by
-   * its projected request dimensions, and a text-only model by the identical
-   * deterministic placeholder the text projection substitutes, so the estimate
-   * never claims visual tokens the request will not spend.
+   * decision from durable metadata alone: an occurrence the surface already
+   * marked `offloaded` is priced as the identical placeholder text the
+   * projection substitutes, and a retained one on an image-capable model by its
+   * projected request dimensions — the very target handed to the attachment
+   * service. A text-only route prices every occurrence as its deterministic
+   * placeholder, so the estimate never claims visual tokens the request will
+   * not spend.
    * @param provider - the `codebuddy` route.
    * @param model - exact model id named by the request.
    * @returns per-occurrence pricing for this route.
@@ -240,35 +329,29 @@ export class CodeBuddyAdapter extends LlmAdapter {
   imageRequestPricing(_provider, model) {
     const connection = this.config.options()
     const configured = connection.models.find(entry => entry.id === model)
-    if (configured?.inputModalities?.includes('image') !== true) {
-      return { priceImages: images => images.map(ref => ({ visualTokens: 0, text: textOnlyImageText(ref) })) }
-    }
-    const policy = resolveImagePolicy(connection, configured)
     const resolveAccess = this.config.resolveImageAccess
+    if (configured?.inputModalities?.includes('image') !== true) {
+      return {
+        priceImages: blocks => blocks.map(block => ({
+          visualTokens: 0,
+          text: textOnlyImageText(block.attachment),
+        })),
+      }
+    }
     return {
-      priceImages: images => {
-        const offloaded = offloadedImagePrefixCount(
-          images.map(ref => Math.min(ref.bytes, policy.maxBytes)),
-          {
-            maxBytes: MAX_REQUEST_IMAGE_BYTES,
-            maxImages: MAX_IMAGES_PER_REQUEST,
-            byteQuantum: IMAGE_OFFLOAD_BYTE_QUANTUM,
-            countQuantum: IMAGE_OFFLOAD_COUNT_QUANTUM,
-          },
-        )
-        return images.map((ref, index) => {
-          if (index < offloaded) {
-            return { visualTokens: 0, text: offloadedImageText(ref, resolveAccess?.(ref)) }
-          }
-          const dimensions = requestImageDimensions(ref.width, ref.height, policy.maxPixels)
-          return {
-            // The gateway discloses no visual-token formula; the area-based
-            // divisor is the conservative conventional estimate.
-            visualTokens: Math.ceil((dimensions.width * dimensions.height) / 750),
-            text: requestImageHandleText(ref, dimensions, resolveAccess?.(ref)),
-          }
-        })
-      },
+      priceImages: blocks => blocks.map((block) => {
+        const { attachment: ref, offloaded } = block
+        if (offloaded === true) {
+          return { visualTokens: 0, text: offloadedImageText(ref, resolveAccess?.(ref)) }
+        }
+        const target = resolveRequestImageTarget(connection, configured, ref)
+        return {
+          // The gateway discloses no visual-token formula; the area-based
+          // divisor is the conservative conventional estimate.
+          visualTokens: Math.ceil((target.width * target.height) / 750),
+          text: requestImageHandleText(ref, target, resolveAccess?.(ref)),
+        }
+      }),
     }
   }
 
@@ -382,22 +465,24 @@ export class CodeBuddyAdapter extends LlmAdapter {
         'UNSUPPORTED_CONTENT',
       )
     }
-    const requestOptions = acceptsImages
-      ? { ...options, messages: offloadRequestImagesWithPolicy(options.messages, {
-          representation: 'base64',
-          maxBytes: MAX_REQUEST_IMAGE_BYTES,
-          maxImages: MAX_IMAGES_PER_REQUEST,
-          byteQuantum: IMAGE_OFFLOAD_BYTE_QUANTUM,
-          countQuantum: IMAGE_OFFLOAD_COUNT_QUANTUM,
-          placeholder: ref => offloadedImageText(ref, this.config.resolveImageAccess?.(ref)),
-        }) }
-      : options
-    const images = acceptsImages && this.config.resolveAttachments !== undefined
+    // Offloading is a durable surface decision, not a per-request one: this
+    // route only substitutes the placeholder text every other route sends too.
+    // It never decides on its own to drop an image — a request that still
+    // exceeds the budget fails with `IMAGE_OFFLOAD_REQUIRED` below, and the
+    // harness records the omission and retries.
+    const messages = acceptsImages
+      ? projectOffloadedImages(
+          options.messages,
+          ref => offloadedImageText(ref, this.config.resolveImageAccess?.(ref)),
+        )
+      : options.messages
+    const requestOptions = { ...options, messages }
+    const images = acceptsImages
       ? await prepareRequestImages(
           requestOptions,
           connection,
           model,
-          this.config.resolveAttachments(),
+          this.config.resolveAttachments?.(),
           this.config.resolveImageAccess,
           signal,
         )

@@ -141,7 +141,7 @@ const MODALITIES = ['text', 'image']
  * @property {string} [workbuddyTokenPath] - Path to the fallback WorkBuddy login document, used only when the CodeBuddy one is not logged in.
  * @property {'enabled'|'disabled'} [thinking] - Deployment thinking policy.
  * @property {'off'|'high'|'max'} [reasoningEffort] - Default thinking effort (default `off`).
- * @property {number} [maxTokens] - Default per-request output cap (default 4,096).
+ * @property {number} [maxTokens] - Default per-request output cap (default 384,000).
  * @property {number} [defaultContextWindow] - Positive context capacity used when the selected model has no exact value.
  * @property {Array} [models] - Advisory models shown by discovery consumers.
  * @property {string[]} [defaultInput] - Modalities for catalog models that declare none (default `['text']`).

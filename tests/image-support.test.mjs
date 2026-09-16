@@ -16,8 +16,10 @@ import assert from 'node:assert/strict'
 const { Config, resolveAdapterOptions } = await import('../src/index.js')
 const { serializeMessages, serializeRequest } = await import('../src/serialize.js')
 const { CodeBuddyAdapter } = await import('../src/adapter.js')
-// Runtime-only helper; imported for the offloading cases.
-const { offloadRequestImagesWithPolicy, offloadedImageText } = await import('@deepseek-ai/dsh-llm')
+// Runtime-only helpers; imported for the durable-offload cases.
+const { IMAGE_OFFLOAD_REQUIRED_CODE, offloadedImageText, projectOffloadedImages } =
+  await import('@deepseek-ai/dsh-llm')
+const { requestImageDimensions } = await import('@deepseek-ai/dsh-attachment')
 
 let pass = 0
 let fail = 0
@@ -106,6 +108,18 @@ check('an empty section resolves with text-only defaults', () => {
   assert.equal(value.imagePixelBudget, 640000)
   assert.equal(value.imageMaxBytes, 1048576)
 })
+// The shipped output cap is deliberately generous (the reference client's own
+// 4,096 truncated real answers that arrived after a long `reasoning_content`
+// preamble). Pin it: nothing else in this suite reads the default, so a silent
+// revert would otherwise pass unnoticed. Precedence stays explicit-value-wins.
+check('the default output cap is 384000, and an explicit value still wins', () => {
+  assert.equal(Config({}).maxTokens, 384_000)
+  assert.equal(resolveAdapterOptions({}).maxTokens, 384_000)
+  assert.equal(resolveAdapterOptions({ maxTokens: 8192 }).maxTokens, 8192)
+  const capped = resolveAdapterOptions({ models: [{ id: 'capped', maxTokens: 512 }] })
+  assert.equal(capped.models[0].maxTokens, 512)
+  assert.equal(capped.maxTokens, 384_000)
+})
 check('the built-in catalog survives the schema with modalities intact', () => {
   const byId = new Map(Config({}).models.map(m => [m.id, m]))
   assert.deepEqual(byId.get('deepseek-v4.1-flash').inputModalities, ['text', 'image'])
@@ -184,19 +198,14 @@ check('serializeRequest stays text-only without images', () => {
   assert.equal(body.stream, true)
 })
 
-console.log('\n== request-limit offloading ==')
-check('an over-budget image becomes placeholder text, not a silent drop', () => {
-  const big = {
-    type: 'image',
-    attachment: { attachmentId: 'big', mediaType: 'image/png', bytes: 5_000_000, width: 10, height: 10 },
-  }
-  const offloaded = offloadRequestImagesWithPolicy([{ role: 'user', content: [big] }], {
-    representation: 'base64',
-    maxBytes: 1_000_000,
-    byteQuantum: 1,
-    countQuantum: 1,
-    placeholder: ref => offloadedImageText(ref, undefined),
-  })
+console.log('\n== durable offload projection ==')
+check('an offloaded occurrence becomes placeholder text, not a silent drop', () => {
+  // Offloading is a durable surface decision now: the adapter substitutes text
+  // for an occurrence the session already marked, and never drops one itself.
+  const offloaded = projectOffloadedImages(
+    [{ role: 'user', content: [{ ...imageBlock('big'), offloaded: true }] }],
+    ref => offloadedImageText(ref, undefined),
+  )
   const text = offloaded[0].content.filter(b => b.type === 'text').map(b => b.text).join('')
   assert.match(text, /image omitted to fit request image limits/)
   // With no image left, the serializer keeps the placeholder on the string form.
@@ -206,7 +215,16 @@ check('an over-budget image becomes placeholder text, not a silent drop', () => 
 })
 
 console.log('\n== adapter capability gate ==')
-const makeAdapter = (models) => new CodeBuddyAdapter({
+/** A stub durable attachment service recording every request target it is asked for. */
+const stubAttachments = (version, targets = []) => ({
+  targets,
+  readImageRequest: async (_ref, target) => {
+    targets.push(target)
+    return version
+  },
+})
+
+const makeAdapter = (models, { attachments } = {}) => new CodeBuddyAdapter({
   options: () => ({
     endpoint: 'https://example.invalid',
     models,
@@ -219,7 +237,7 @@ const makeAdapter = (models) => new CodeBuddyAdapter({
     retryPolicy: {},
   }),
   resolveSession: async () => ({ accessToken: 't' }),
-  resolveAttachments: () => undefined,
+  resolveAttachments: () => attachments,
   resolveImageAccess: () => undefined,
 })
 
@@ -229,7 +247,7 @@ const runStream = async (adapter, messages) => {
     const chunks = await collect(adapter.stream({ model: 'plain', messages, purpose: 'conversation' }))
     return { failure: chunks.find(c => c.type === 'finish' && c.reason?.kind === 'error') }
   } catch (error) {
-    return { code: error.code, message: error.message }
+    return { code: error.code, message: error.message, failure: error.failure }
   }
 }
 
@@ -248,17 +266,31 @@ check('an uncatalogued model declares text-only', async () => {
 check('imageRequestPricing prices a text-only route as placeholder text', () => {
   const adapter = makeAdapter([{ id: 'plain', inputModalities: ['text'] }])
   const [price] = adapter.imageRequestPricing('codebuddy', 'plain').priceImages([
-    { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 4, height: 4 },
+    { type: 'image', attachment: { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 4, height: 4 } },
   ])
   assert.equal(price.visualTokens, 0)
   assert.match(price.text, /text only/)
 })
-check('imageRequestPricing charges visual tokens for a vision route', () => {
+check('imageRequestPricing charges visual tokens for a retained vision-route occurrence', () => {
   const adapter = makeAdapter([{ id: 'vision', inputModalities: ['text', 'image'] }])
   const [price] = adapter.imageRequestPricing('codebuddy', 'vision').priceImages([
-    { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 800, height: 800 },
+    { type: 'image', attachment: { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 800, height: 800 } },
   ])
   assert.ok(price.visualTokens > 0)
+})
+check('imageRequestPricing prices a durably offloaded occurrence as its placeholder', () => {
+  // Pricing must reproduce the projection from durable metadata alone: an
+  // occurrence the surface marked offloaded spends no visual tokens.
+  const adapter = makeAdapter([{ id: 'vision', inputModalities: ['text', 'image'] }])
+  const [price] = adapter.imageRequestPricing('codebuddy', 'vision').priceImages([
+    {
+      type: 'image',
+      offloaded: true,
+      attachment: { attachmentId: 'a1', mediaType: 'image/png', bytes: 10, width: 800, height: 800 },
+    },
+  ])
+  assert.equal(price.visualTokens, 0)
+  assert.match(price.text, /image omitted to fit request image limits/)
 })
 
 // The gate must reject BEFORE dispatch: the endpoint is unroutable, so a
@@ -273,8 +305,48 @@ check('a text-only model rejects an image before dispatch', async () => {
   assert.ok(!/TRANSPORT|fetch failed|ENOTFOUND|EAI_AGAIN/.test(detail), `dispatched to network: ${detail}`)
 })
 
-check('a vision model with an image passes the gate', async () => {
+// dsh 0.1.6-alpha.1 moved request-target resolution to the adapter: the
+// attachment service now receives an exact {width,height,maxBytes} target
+// instead of the old {maxPixels,maxBytes} policy object.
+check('a retained image is prepared at an exact request target', async () => {
+  const version = { mediaType: 'image/png', data: Uint8Array.from([1]), bytes: 3, width: 8, height: 8 }
+  const store = stubAttachments(version)
+  const result = await runStream(makeAdapter([{ id: 'plain', inputModalities: ['text', 'image'] }], {
+    attachments: store,
+  }), [{ role: 'user', content: [imageBlock('a1')] }])
+  const [target] = store.targets
+  assert.deepEqual(Object.keys(target).sort(), ['height', 'maxBytes', 'width'])
+  assert.equal(target.maxBytes, 1048576)
+  const expected = requestImageDimensions(10, 10, 640000)
+  assert.deepEqual({ width: target.width, height: target.height }, expected)
+  // It got PAST preparation and failed on the unroutable host instead.
+  assert.ok(!/could not be prepared/.test(JSON.stringify(result)))
+})
+
+check('an over-budget retained image asks for durable offload, not a silent drop', async () => {
+  // 128 MiB raw is ~178 MiB base64, past the route's 128 MiB accumulated bound.
+  const version = { mediaType: 'image/png', data: Uint8Array.from([1]), bytes: 128 * 1024 * 1024, width: 8, height: 8 }
+  const result = await runStream(makeAdapter([{ id: 'plain', inputModalities: ['text', 'image'] }], {
+    attachments: stubAttachments(version),
+  }), [{ role: 'user', content: [imageBlock('a1')] }])
+  assert.equal(result.code, IMAGE_OFFLOAD_REQUIRED_CODE, JSON.stringify(result))
+  assert.equal(result.failure?.offloadImages, 1)
+  assert.ok(!/TRANSPORT|fetch failed|ENOTFOUND|EAI_AGAIN/.test(JSON.stringify(result)), 'dispatched to network')
+})
+
+check('a retained image with no mounted attachment service fails loudly', async () => {
   const result = await runStream(makeAdapter([{ id: 'plain', inputModalities: ['text', 'image'] }]), [{
+    role: 'user',
+    content: [imageBlock('a1')],
+  }])
+  assert.match(JSON.stringify(result), /mount the durable attachment service/)
+  assert.ok(!/TRANSPORT|fetch failed|ENOTFOUND|EAI_AGAIN/.test(JSON.stringify(result)), 'dispatched to network')
+})
+
+check('a vision model with an image passes the gate', async () => {
+  const result = await runStream(makeAdapter([{ id: 'plain', inputModalities: ['text', 'image'] }], {
+    attachments: stubAttachments({ mediaType: 'image/png', data: Uint8Array.from([1]), bytes: 3, width: 8, height: 8 }),
+  }), [{
     role: 'user',
     content: [{ type: 'text', text: 'look' }, imageBlock('a1')],
   }])
