@@ -104,11 +104,11 @@ The bundle layer inserts exactly one plugin row:
 
 ```sh
 # pack (runs check-pack via prepack)
-cd plugins/dsh-codebuddy-code && npm pack     # -> dsh-codebuddy-code-0.4.0.tgz
+cd plugins/dsh-codebuddy-code && npm pack     # -> dsh-codebuddy-code-0.4.1.tgz
 
 # install into the real web profile (from the parent dir or by tgz path)
 dsh plugin --profile web add D:\path\to\dsh-codebuddy-code          # from source dir
-dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.4.0.tgz
+dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.4.1.tgz
 dsh plugin --profile web remove dsh-codebuddy-code                   # removes deps + layer
 # restart `dsh web` after install/remove
 ```
