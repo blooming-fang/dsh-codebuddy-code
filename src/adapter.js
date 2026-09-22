@@ -168,10 +168,16 @@ function resolveRequestImageTarget(connection, model, ref) {
 
 /**
  * Collect every RETAINED durable image occurrence in a request, in request
- * order. Tool-result content is walked because a tool (a screenshot reader,
- * say) can return an image nested inside a result. An occurrence already marked
- * `offloaded` is a durable decision every route honors, so it is left to
- * {@link projectOffloadedImages} instead of being prepared again.
+ * order. The walk is FLAT and per message, matching dsh `0.1.7-alpha.1`'s own
+ * `visitImageBlocks` exactly: a tool result is a first-class `role: 'tool'`
+ * message whose content holds its images directly, so the message walk reaches
+ * them without descending into a block. Walking any deeper would count
+ * occurrences `requiredImageOffload` does not, and the two disagreeing about
+ * the same request is how an image gets dropped or double-priced.
+ *
+ * An occurrence already marked `offloaded` is a durable decision every route
+ * honors, so it is left to {@link projectOffloadedImages} instead of being
+ * prepared again.
  * @param content - one message's content blocks.
  * @param refs - insertion-ordered map keyed by attachment id, deduplicating occurrences of the same image.
  */
@@ -179,8 +185,6 @@ function collectImageRefs(content, refs) {
   for (const block of content) {
     if (block.type === 'image' && block.offloaded !== true) {
       refs.set(block.attachment.attachmentId, block.attachment)
-    } else if (block.type === 'tool-result') {
-      collectImageRefs(block.content, refs)
     }
   }
 }

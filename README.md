@@ -36,10 +36,25 @@ dsh-codebuddy-code/
 
 本包是 `packages/llm/llm-codebuddy`（workspace TypeScript，rc.5）的**自包含 JS 移植**，面向已安装的 dsh。若你从源码 checkout 跑 dsh，用 workspace 包即可；这里的内嵌版本与已安装 dsh 完全兼容，不需要发布或构建 workspace 包。
 
-**版本要求：dsh `0.1.6-alpha.1` 及以上（插件 0.3.1 起）。** dsh `0.1.6-alpha.1` 把「请求级图片裁剪」换成了「会话级持久化裁剪」：`@deepseek-ai/dsh-llm` 不再导出 `offloadRequestImagesWithPolicy` / `offloadedImagePrefixCount`，改为 `requiredImageOffload` + `projectOffloadedImages`，`attachments.readImageRequest` 也从 `{ maxPixels, maxBytes }` 策略对象改为精确的 `{ width, height, maxBytes }` 目标。0.3.0 及更早的插件仍引用旧 API，在这种 dsh 上**启动即崩溃**：
+**版本要求：dsh `0.1.7-alpha.1`（插件 0.4.0 起）。** 版本线严格对应，不能混用：
+
+| 插件 | 对应 dsh | 原因 |
+|---|---|---|
+| `0.4.x` | `0.1.7-alpha.1` | 工具结果是一等 `role: 'tool'` 消息；Config 必须全字段 volatile |
+| `0.3.x` | `0.1.6-alpha.1` | `tool-result` 块 + `installSection` + 非 volatile Config |
+
+dsh `0.1.7-alpha.1` 有四处会影响本插件的破坏性变更：
+
+1. **工具结果成为一等消息。** `ContentBlockMap` 里不再有 `tool-result`；`createToolResultMessage` 产生 `{ role: 'tool', toolCallId, isError?, content }`。按旧词汇表解析会把工具消息当成 user 消息重发，且工具返回的图片被静默丢弃。
+2. **`SettingsForms.installSection` 被移除。** 插件 Config 现在来自模块导出的 `Config`，实时值来自 `.volatile()` 引用（Loader 就地提交、不重挂载），`settings.configure({ auto: false }, ctx.fiber)` 只声明页面策略。
+3. **非 volatile 字段无法配置。** `SettingsForms.write()` 对没有 volatile 字段的条目直接抛 `Plugin entry "X" has no volatile fields`，且拒绝任何非 volatile 路径——不升级的插件在 Models 页面上**存不进任何设置**。
+4. **`contentHasImage` / `visitImageBlocks` 变成扁平遍历**，与第 1 点配套；按嵌套块递归会与 `requiredImageOffload` 的计数不一致。
+
+依赖侧同样要跟上：`@deepseek-ai/schemastery` 需 `^3.18.3`（`3.18.2` 没有 `.volatile()`），peer 全部对齐 `^0.1.7-alpha.1`。旧版插件在这种 dsh 上的表现：
 
 ```
-SyntaxError: The requested module '@deepseek-ai/dsh-llm' does not provide an export named 'offloadRequestImagesWithPolicy'
+TypeError: z.object(...).volatile is not a function          # schemastery 3.18.2
+Error: Plugin entry "llm-codebuddy" has no volatile fields   # 非 volatile Config
 ```
 
 升级方式见下方「安装」。
@@ -63,7 +78,7 @@ dsh plugin --profile web add dsh-codebuddy-code
 ```sh
 cd plugins/dsh-codebuddy-code
 npm pack
-# 生成 dsh-codebuddy-code-0.3.3.tgz
+# 生成 dsh-codebuddy-code-0.4.0.tgz
 ```
 
 该包所有依赖（`@deepseek-ai/dsh-llm`、`@deepseek-ai/dsh-attachment`、`@deepseek-ai/dsh-settings`、`@deepseek-ai/dsh-timeout`、`@deepseek-ai/dsh-invariants`、`@deepseek-ai/cordis`、`@deepseek-ai/schemastery`、`eventsource-parser`）都已在已安装 dsh 的 profile 依赖闭包 / module fallback 里，bundle 以 peer 直接依赖的形式解析到同一实例，无需额外 `pnpm install`。
@@ -71,8 +86,8 @@ npm pack
 已装过旧版时**必须带版本号升级**：profile 的 `package.json` 按路径钉住 tgz，版本号不变时 pnpm 会继续使用已解包的旧副本。升级后重启 `dsh web`：
 
 ```sh
-cd plugins/dsh-codebuddy-code && npm pack                                  # 0.3.3
-dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.3.3.tgz
+cd plugins/dsh-codebuddy-code && npm pack                                  # 0.4.0
+dsh plugin --profile web add D:\path\to\dsh-codebuddy-code-0.4.0.tgz
 ```
 
 离线回归测试要在**已安装的 profile 副本**里跑（peer 依赖只能靠 profile 的 module fallback 解析）：

@@ -1,9 +1,19 @@
 /**
  * Serialize harness messages into CodeBuddy chat completions. User text is
  * joined; assistant text becomes `content`, tool calls become `tool_calls`,
- * and tool results become separate tool messages. Assistant reasoning is
- * replayed as `reasoning_content` only on tool-call turns, mirroring the
+ * and a tool result becomes a `role: 'tool'` wire message. Assistant reasoning
+ * is replayed as `reasoning_content` only on tool-call turns, mirroring the
  * DeepSeek thinking-mode passback rule the gateway serves unchanged.
+ *
+ * The harness vocabulary this reads is dsh `0.1.7-alpha.1`'s: a tool result is
+ * a first-class `role: 'tool'` message (`toolCallId`, `isError`), NOT a
+ * `tool-result` block nested inside a user message. `0.1.7` removed
+ * `tool-result` from `ContentBlockMap` and made `contentHasImage` a flat
+ * walk, so a nested-block read would miss every tool image and silently erase
+ * it. Roles and blocks the chat-completions form cannot represent (a
+ * `developer` message, a `tool-addition`/`tool-removal` control block) fail
+ * loud instead, exactly as the official `dsh-llm-deepseek` adapter refuses
+ * them.
  *
  * Images ride the OpenAI-family `image_url` content-part form, which the
  * CodeBuddy gateway accepts for every model it serves. Acceptance is NOT
@@ -24,13 +34,15 @@ const TOOL_RESULT_IMAGE_TEXT = 'Images returned by the preceding tool call.'
 
 /**
  * Reject image content in a role the chat-completions image form cannot carry.
- * Images are representable only in user-role parts, so an image anywhere else
- * must fail loudly instead of being erased by the text join.
+ * Images ride user-role parts, so a system or assistant image must fail loudly
+ * instead of being erased by the text join. A TOOL result is the one other
+ * carrier: its image is legal here because {@link serializeMessages} moves it,
+ * with its handle text, into the user message that follows the tool message.
  * @param role - the harness message role being serialized.
  * @param blocks - that message's content blocks.
  */
 function assertSupportedImageRole(role, blocks) {
-  if (role !== 'user' && contentHasImage(blocks)) {
+  if (role !== 'user' && role !== 'tool' && contentHasImage(blocks)) {
     throw new LlmError(
       `The CodeBuddy chat-completions adapter cannot represent image content in a ${role} message.`,
       'UNSUPPORTED_CONTENT',
@@ -38,7 +50,46 @@ function assertSupportedImageRole(role, blocks) {
   }
 }
 
-/** Join the text blocks of a message (used for user/tool-result content). */
+/**
+ * Block types each role can contribute, in the chat-completions form. A system
+ * message is text only; user and tool content may carry images (a tool image
+ * moves to the carrier message) and omit reasoning/tool-call blocks the same
+ * way the official DeepSeek adapter does; an assistant turn carries text,
+ * reasoning, and tool calls.
+ *
+ * `image` is listed for every role because {@link assertSupportedImageRole}
+ * judges it first and reports the role-specific image message; this table only
+ * decides what is left to refuse.
+ */
+const REPRESENTABLE_BLOCKS = {
+  system: ['text', 'image'],
+  user: ['text', 'image', 'reasoning', 'tool-call'],
+  tool: ['text', 'image', 'reasoning', 'tool-call'],
+  assistant: ['text', 'image', 'reasoning', 'tool-call'],
+}
+
+/**
+ * Refuse a message carrying a block this wire form has no representation for.
+ *
+ * This runs for EVERY message regardless of whether the request carries an
+ * image: gating it behind the image path is how an unknown block gets dropped
+ * without a trace on a text-only request.
+ * @param role - the harness message role being serialized.
+ * @param blocks - that message's content blocks.
+ */
+function assertRepresentable(role, blocks) {
+  assertSupportedImageRole(role, blocks)
+  const allowed = REPRESENTABLE_BLOCKS[role]
+  for (const block of blocks) {
+    if (allowed.includes(block.type)) continue
+    throw new LlmError(
+      `The CodeBuddy chat-completions adapter cannot represent ${block.type} content in a ${role} message.`,
+      'UNSUPPORTED_CONTENT',
+    )
+  }
+}
+
+/** Join the text blocks of a message (used for user/tool content). */
 function flattenText(blocks) {
   return blocks
     .filter(block => block.type === 'text')
@@ -81,7 +132,6 @@ function resolveThinking(options, defaults) {
 
 /** Serialize one assistant message (text + reasoning + tool calls). */
 function serializeAssistant(message) {
-  assertSupportedImageRole('assistant', message.content)
   const text = flattenText(message.content)
   const reasoning = message.content
     .filter(block => block.type === 'reasoning')
@@ -155,11 +205,20 @@ function contentParts(blocks, images) {
         })
         break
       }
-      case 'tool-result':
-        parts.push(...contentParts(block.content, images))
+      // Reasoning and tool-call blocks belong to assistant turns; the official
+      // DeepSeek adapter omits them from user/tool content, so a block that
+      // drifted into the wrong role is dropped the same way rather than
+      // inventing wire content for it.
+      case 'reasoning':
+      case 'tool-call':
         break
       default:
-        break
+        // Unknown/unsupported blocks fail loud. Silently skipping one is how an
+        // image would disappear from a request the model then answers anyway.
+        throw new LlmError(
+          `The CodeBuddy chat-completions adapter cannot represent ${block.type} content on the wire.`,
+          'UNSUPPORTED_CONTENT',
+        )
     }
   }
   return parts
@@ -188,10 +247,32 @@ function userContent(parts) {
 }
 
 /**
- * Serialize the conversation. `tool-result` blocks become standalone
- * `{ role: 'tool' }` messages; the harness puts each tool result in its own
- * user-role message, so a mixed user message contributes its text first and
- * its tool results as separate wire messages after.
+ * Split one tool message's serialized parts into the text a `role: 'tool'`
+ * wire message can carry and the image parts that must move elsewhere.
+ * @param message - the harness tool message.
+ * @param useParts - whether the request carries any image at all.
+ * @param images - prepared request versions.
+ * @returns the wire tool content and the parts that move to a user message.
+ */
+function toolResultParts(message, useParts, images) {
+  const parts = useParts
+    ? contentParts(message.content, images)
+    : [{ type: 'text', text: flattenText(message.content) }]
+  // A `tool` message carries text only, so each image and its handle text move
+  // together to the following user message, order preserved.
+  return {
+    carried: parts.filter(part => part.type !== 'text' || part.imageHandle === true),
+    text: parts
+      .filter(part => part.type === 'text' && part.imageHandle !== true)
+      .map(part => part.text)
+      .join(''),
+  }
+}
+
+/**
+ * Serialize the conversation. A harness tool result is a first-class
+ * `role: 'tool'` message in dsh `0.1.7-alpha.1` and becomes one wire
+ * `{ role: 'tool', tool_call_id }` message.
  *
  * A tool result carrying an image cannot ride a `tool` message (the wire form
  * has no image parts there), so its images are emitted in one following
@@ -199,7 +280,7 @@ function userContent(parts) {
  *
  * @param messages - the harness conversation, in order.
  * @param images - prepared request versions, or undefined when the request carries no images.
- * @returns the wire messages; order preserved, each tool result expanded into its own entry.
+ * @returns the wire messages; order preserved.
  */
 export function serializeMessages(messages, images) {
   const wire = []
@@ -217,8 +298,23 @@ export function serializeMessages(messages, images) {
     })
   }
   for (const message of messages) {
+    // Control-only roles and blocks have no chat-completions representation.
+    // The official dsh-llm-deepseek adapter refuses them too; inventing wire
+    // content for them would silently misrepresent the conversation.
+    if (message.role === 'developer') {
+      throw new LlmError(
+        'The CodeBuddy chat-completions adapter cannot represent a developer message.',
+        'UNSUPPORTED_CONTENT',
+      )
+    }
+    if (message.content.some(block => block.type === 'tool-addition' || block.type === 'tool-removal')) {
+      throw new LlmError(
+        'The CodeBuddy chat-completions adapter cannot represent tool-change blocks.',
+        'UNSUPPORTED_CONTENT',
+      )
+    }
+    assertRepresentable(message.role, message.content)
     if (message.role === 'system') {
-      assertSupportedImageRole('system', message.content)
       flushToolImages()
       wire.push({ role: 'system', content: flattenText(message.content) })
       continue
@@ -228,36 +324,26 @@ export function serializeMessages(messages, images) {
       wire.push(serializeAssistant(message))
       continue
     }
-    // user role: tool results ride in user messages in the harness
-    // vocabulary, but the gateway wants them as role:'tool' messages.
-    const regular = message.content.filter(block => block.type !== 'tool-result')
-    const toolResults = message.content.filter(block => block.type === 'tool-result')
-    const content = useParts
-      ? userContent(contentParts(regular, images))
-      : flattenText(regular)
-    if (content.length > 0 || toolResults.length === 0) {
-      flushToolImages()
-      wire.push({ role: 'user', content })
-    }
-    for (const result of toolResults) {
-      const parts = useParts
-        ? contentParts(result.content, images)
-        : [{ type: 'text', text: flattenText(result.content) }]
-      // A `tool` message carries text only, so each image and its handle text
-      // move together to the following user message, order preserved.
-      const carried = parts.filter(part => part.type !== 'text' || part.imageHandle === true)
-      const text = parts
-        .filter(part => part.type === 'text' && part.imageHandle !== true)
-        .map(part => part.text)
-        .join('')
+    if (message.role === 'tool') {
+      // The images flush BEFORE the tool message would break the call/result
+      // pairing the gateway checks, so the tool message goes out first and its
+      // images ride the user message that follows it.
+      const { carried, text } = toolResultParts(message, useParts, images)
       wire.push({
         role: 'tool',
-        tool_call_id: result.toolCallId,
+        tool_call_id: message.toolCallId,
         // Empty tool output still needs SOME content on the wire.
         content: text || '(no output)',
       })
       pendingToolImages.push(...carried.map(wirePart))
+      continue
     }
+    // user role
+    const content = useParts
+      ? userContent(contentParts(message.content, images))
+      : flattenText(message.content)
+    flushToolImages()
+    wire.push({ role: 'user', content })
   }
   flushToolImages()
   return wire

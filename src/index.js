@@ -1,12 +1,14 @@
 /**
  * Register a {@link CodeBuddyAdapter} for the `codebuddy` provider route on
  * `ctx.llm`, with connection facts resolved per request instead of frozen at
- * load: the plugin layers its `cordis.yml` entry config under the optional
- * `llm-codebuddy` user-settings section (`ctx.settings`), so a changed
- * endpoint, catalog, or token path reaches the very next request without
- * restarting anything, while an in-flight stream keeps the facts it started
- * with. The one registration-captured fact — the retry policy — re-registers
- * the route in place when it changes.
+ * load, so a changed endpoint, catalog, or token path reaches the very next
+ * request without restarting anything, while an in-flight stream keeps the
+ * facts it started with. On dsh `0.1.7-alpha.1` that liveness comes from the
+ * Config's `.volatile()` fields — the Loader commits an edited value into
+ * the running fiber's reference without remounting the plugin — which
+ * `plainOptions` reads back into a plain snapshot per operation. The one
+ * registration-captured fact, the retry policy, re-registers the route in place
+ * when it changes.
  *
  * The bearer session is the machine's CodeBuddy (or WorkBuddy) login, not a
  * product API key: `CODEBUDDY_AUTH_TOKEN` / `CODEBUDDY_API_KEY` env overrides
@@ -166,20 +168,27 @@ const catalogModel = z.object({
   imageMaxBytes: z.number().step(1).min(1),
 })
 
+// Every field is `.volatile()` because dsh `0.1.7-alpha.1` made that the ONLY
+// editable kind: `SettingsForms.write()` throws "has no volatile fields" for an
+// entry whose schema declares none, and rejects every non-volatile path. A
+// volatile node parses to a live reference the Loader commits into the running
+// fiber without remounting it, which is exactly the "a changed endpoint reaches
+// the very next request" contract this plugin already documented — read through
+// `plainOptions` below, never directly.
 export const Config = z.object({
-  endpoint: z.string().default(DEFAULT_ENDPOINT),
-  tokenPath: z.string(),
-  workbuddyTokenPath: z.string(),
-  thinking: z.union(['enabled', 'disabled']),
-  reasoningEffort: z.union(['off', 'high', 'max']).default('off'),
-  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS),
-  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  models: z.array(catalogModel).default(DEFAULT_MODELS),
-  defaultInput: z.array(z.union(MODALITIES)).default(['text']),
-  imagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET),
-  imageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES),
-  streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
-  retryPolicy: RetryPolicySchema,
+  endpoint: z.string().default(DEFAULT_ENDPOINT).volatile(),
+  tokenPath: z.string().volatile(),
+  workbuddyTokenPath: z.string().volatile(),
+  thinking: z.union(['enabled', 'disabled']).volatile(),
+  reasoningEffort: z.union(['off', 'high', 'max']).default('off').volatile(),
+  maxTokens: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_MAX_TOKENS).volatile(),
+  defaultContextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW).volatile(),
+  models: z.array(catalogModel).default(DEFAULT_MODELS).volatile(),
+  defaultInput: z.array(z.union(MODALITIES)).default(['text']).volatile(),
+  imagePixelBudget: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET).volatile(),
+  imageMaxBytes: z.number().step(1).min(1).default(DEFAULT_REQUEST_IMAGE_MAX_BYTES).volatile(),
+  streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS).volatile(),
+  retryPolicy: RetryPolicySchema.volatile(),
 })
 
 /** The desktop app's CodeBuddy auth file name under LOCALAPPDATA; the tokenPath default. */
@@ -294,6 +303,50 @@ function resolveModels(models, defaultInput = ['text']) {
 }
 
 /**
+ * The cross-copy marker every Schemastery volatile reference carries.
+ *
+ * Schemastery's `.volatile()` output is a `createVolatile` reference from
+ * `@deepseek-ai/cosmokit`, identified by a GLOBALLY REGISTERED symbol precisely
+ * so independent copies of the library agree ("Identify references across
+ * ESM/CJS copies of the shared library"). This bundle reaches it through the
+ * protocol rather than by importing cosmokit, because the profile hoists an
+ * OLDER cosmokit (1.8.3, no volatile protocol) at its root, so a bare
+ * `import { isVolatile } from '@deepseek-ai/cosmokit'` would resolve to a copy
+ * that cannot see the reference at all.
+ */
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/** Whether one parsed config value is a Schemastery volatile reference. */
+function isVolatileValue(value) {
+  return typeof value === 'object' && value !== null && VOLATILE_WRITE in value
+}
+
+/**
+ * Read the current value behind every volatile reference of a parsed Config.
+ *
+ * dsh `0.1.7-alpha.1` parses a `.volatile()` field to a live reference the
+ * Loader updates in place, so the parsed config object keeps one identity while
+ * its values change; `plainOptions` is what turns that back into the plain
+ * snapshot the resolver judges. Tolerates an already-plain value so the
+ * resolver stays callable with a hand-built config.
+ * @param config - a parsed plugin Config, or a plain config object.
+ * @returns the same keys with every volatile reference read.
+ */
+export function plainOptions(config) {
+  return Object.fromEntries(
+    Object.entries(config).map(([key, value]) => [key, isVolatileValue(value) ? value.get() : value]),
+  )
+}
+
+/**
+ * Whether one parsed Config field is volatile, i.e. editable from the settings
+ * UI. Exported for the regression suite that pins the dsh 0.1.7 requirement.
+ * @param value - one parsed Config field value.
+ * @returns whether it is a live volatile reference.
+ */
+export const isVolatileField = isVolatileValue
+
+/**
  * The one explicit resolve step from raw config to validated connection
  * facts. Programmatic construction may bypass Schemastery normalization, so
  * every default and bound is re-judged here — for the composition entry at
@@ -350,16 +403,35 @@ export function resolveAdapterOptions(config) {
 }
 
 export function apply(ctx, config) {
-  let current = () => config
   let lastRaw
   let lastGood
+  // The retry policy is the one fact the registry captures at registration
+  // rather than re-reading per request, so a change to it must re-register the
+  // route. Assigned after the first `options()` below; until then there is no
+  // registration to refresh.
+  let registration
+  let registeredPolicy
+  const ensureRegistrationFacts = () => {
+    if (registration === undefined) return
+    const policy = lastGood.retryPolicy
+    if (deepEqualJson(policy, registeredPolicy)) return
+    // One synchronous registry section: disposing and re-registering instead
+    // would publish an empty route set in between, and an observer that reacted
+    // to it would see this provider disappear and come back.
+    registration.replace([PROVIDER])
+    registeredPolicy = policy
+  }
   const options = () => {
-    const raw = current()
-    if (raw === lastRaw && lastGood !== undefined) return lastGood
+    // Volatile fields keep the parsed config's identity while their values
+    // change in place, so identity can no longer detect a settings edit: the
+    // plain snapshot is compared by value instead.
+    const raw = plainOptions(config)
+    if (lastRaw !== undefined && deepEqualJson(raw, lastRaw)) return lastGood
     try {
       const next = resolveAdapterOptions(raw)
       lastRaw = raw
       lastGood = next
+      ensureRegistrationFacts()
       return next
     } catch (error) {
       // Static composition resolves before anything registers, so this branch
@@ -462,27 +534,17 @@ export function apply(ctx, config) {
     { provider: PROVIDER, displayName: 'CodeBuddy', settingsNs: NS, settingsPath: [] },
   ])
   // Route effects bind to this apply fiber via the stable `ctx` reference,
-  // even when a swap runs inside the scoped settings callback below.
-  const registration = ctx.llm.registerAdapter([PROVIDER], adapter)
-  let registeredPolicy = options().retryPolicy
-  const ensureRegistrationFacts = () => {
-    const policy = options().retryPolicy
-    if (deepEqualJson(policy, registeredPolicy)) return
-    // The registry captures the retry policy at registration, so it is the one
-    // fact per-request resolution cannot refresh. `replace` re-reads it in one
-    // synchronous registry section: disposing and re-registering instead would
-    // publish an empty route set between the two, and an observer that reacted
-    // to it would see this provider disappear and come back.
-    registration.replace([PROVIDER])
-    registeredPolicy = policy
-  }
+  // even when the scoped settings callback below runs on a child context.
+  registration = ctx.llm.registerAdapter([PROVIDER], adapter)
+  registeredPolicy = lastGood.retryPolicy
 
+  // dsh `0.1.7-alpha.1` dropped `SettingsForms.installSection`; a plugin's
+  // Config schema now comes from the module's own `Config` export, its live
+  // values from the volatile references the Loader commits in place, and this
+  // call only declares the page policy. `auto: false` mirrors every official
+  // LLM provider adapter: this route is configured on the Models page, so no
+  // second auto-generated page is wanted.
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => {
-        current = source
-      },
-      onChange: ensureRegistrationFacts,
-    })
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
   })
 }

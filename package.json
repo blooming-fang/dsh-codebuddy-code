@@ -1,6 +1,6 @@
 {
   "name": "dsh-codebuddy-code",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login, with per-model measured image input",
   "keywords": [
     "deepseek-harness",
@@ -52,16 +52,16 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.2",
+    "@deepseek-ai/schemastery": "^3.18.3",
     "eventsource-parser": "^3.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-attachment": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-llm": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-settings": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-timeout": "^0.1.6-alpha.1",
-    "@deepseek-ai/dsh-util-values": "^0.1.6-alpha.1"
+    "@deepseek-ai/cordis": "^4.0.3",
+    "@deepseek-ai/dsh-attachment": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-invariants": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-llm": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-settings": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-timeout": "^0.1.7-alpha.1",
+    "@deepseek-ai/dsh-util-values": "^0.1.7-alpha.1"
   }
 }

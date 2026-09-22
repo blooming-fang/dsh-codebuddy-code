@@ -13,7 +13,7 @@
  */
 import assert from 'node:assert/strict'
 
-const { Config, resolveAdapterOptions } = await import('../src/index.js')
+const { Config, isVolatileField, plainOptions, resolveAdapterOptions } = await import('../src/index.js')
 const { serializeMessages, serializeRequest } = await import('../src/serialize.js')
 const { CodeBuddyAdapter } = await import('../src/adapter.js')
 // Runtime-only helpers; imported for the durable-offload cases.
@@ -102,8 +102,26 @@ check('an empty inputModalities list means "unspecified", not an error', () => {
 })
 
 console.log('\n== Config schema (as the settings pipeline applies it) ==')
+// dsh 0.1.7 parses every `\`.volatile()\`` field to a live reference the Loader
+// commits in place, so the parsed section is read through `plainOptions`.
+check('every Config field is volatile, the only editable kind in dsh 0.1.7', () => {
+  // Two independent halves of the same contract. `SettingsForms.volatileForm`
+  // and `isVolatilePath` read the SCHEMA meta; the Loader's `volatileEntries`
+  // reads the PARSED value marker. A field missing either half is uneditable.
+  for (const [key, field] of Object.entries(Config.dict)) {
+    assert.equal(field.meta.volatile, true, `Config schema field "${key}" must declare .volatile()`)
+  }
+  const parsed = Config({})
+  for (const [key, value] of Object.entries(parsed)) {
+    assert.ok(isVolatileField(value), `Config field "${key}" must parse to a volatile reference`)
+  }
+  // The bug this pins: SettingsForms.write() throws "has no volatile fields"
+  // for an entry whose schema declares none, so a non-volatile Config is
+  // silently unconfigurable rather than broken loudly.
+  assert.deepEqual(Object.keys(plainOptions(parsed)).sort(), Object.keys(parsed).sort())
+})
 check('an empty section resolves with text-only defaults', () => {
-  const value = Config({})
+  const value = plainOptions(Config({}))
   assert.deepEqual(value.defaultInput, ['text'])
   assert.equal(value.imagePixelBudget, 640000)
   assert.equal(value.imageMaxBytes, 1048576)
@@ -113,7 +131,7 @@ check('an empty section resolves with text-only defaults', () => {
 // preamble). Pin it: nothing else in this suite reads the default, so a silent
 // revert would otherwise pass unnoticed. Precedence stays explicit-value-wins.
 check('the default output cap is 384000, and an explicit value still wins', () => {
-  assert.equal(Config({}).maxTokens, 384_000)
+  assert.equal(plainOptions(Config({})).maxTokens, 384_000)
   assert.equal(resolveAdapterOptions({}).maxTokens, 384_000)
   assert.equal(resolveAdapterOptions({ maxTokens: 8192 }).maxTokens, 8192)
   const capped = resolveAdapterOptions({ models: [{ id: 'capped', maxTokens: 512 }] })
@@ -121,7 +139,7 @@ check('the default output cap is 384000, and an explicit value still wins', () =
   assert.equal(capped.maxTokens, 384_000)
 })
 check('the built-in catalog survives the schema with modalities intact', () => {
-  const byId = new Map(Config({}).models.map(m => [m.id, m]))
+  const byId = new Map(plainOptions(Config({})).models.map(m => [m.id, m]))
   assert.deepEqual(byId.get('deepseek-v4.1-flash').inputModalities, ['text', 'image'])
   assert.deepEqual(byId.get('glm-5v-turbo').inputModalities, ['text'])
 })
@@ -130,9 +148,9 @@ check('a trailing-comma maxTokens is rejected by the schema, not silently kept',
   assert.throws(() => Config({ maxTokens: '177824,' }), /expected number/)
 })
 check('per-model image budgets flow into the resolved catalog', () => {
-  const resolved = resolveAdapterOptions(Config({
+  const resolved = resolveAdapterOptions(plainOptions(Config({
     models: [{ id: 'vlm', inputModalities: ['text', 'image'], imageMaxBytes: 500000 }],
-  }))
+  })))
   assert.equal(resolved.models[0].imageMaxBytes, 500000)
   assert.equal(resolved.imagePixelBudget, 640000)
 })
@@ -178,19 +196,80 @@ check('rejects an image in an assistant message', () => {
     /cannot represent image content in a assistant message/,
   )
 })
+// dsh 0.1.7 made a tool result a first-class `role: 'tool'` message
+// (toolCallId + content), replacing the `tool-result` block that used to be
+// nested inside a user message. Reading the old shape left the image
+// uncollected, `useParts` false, and the whole result re-emitted as a user
+// message — the regression these cases pin.
+check('a tool message becomes one wire tool message', () => {
+  const wire = serializeMessages([{
+    role: 'tool',
+    toolCallId: 'call-1',
+    content: [{ type: 'text', text: 'screenshot' }],
+  }], undefined)
+  assert.equal(wire.length, 1)
+  assert.equal(wire[0].role, 'tool')
+  assert.equal(wire[0].tool_call_id, 'call-1')
+  assert.equal(wire[0].content, 'screenshot')
+})
+check('a tool message never becomes a user message', () => {
+  const wire = serializeMessages([
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'call-1', name: 'shot', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'call-1', content: [{ type: 'text', text: 'ok' }] },
+  ], undefined)
+  assert.deepEqual(wire.map(m => m.role), ['assistant', 'tool'])
+  assert.equal(wire.filter(m => m.role === 'user').length, 0)
+})
+check('an empty tool result still carries content', () => {
+  const wire = serializeMessages([{ role: 'tool', toolCallId: 'call-1', content: [] }], undefined)
+  assert.equal(wire[0].content, '(no output)')
+})
 check('a tool result image moves to a following user message', () => {
   const wire = serializeMessages([{
-    role: 'user',
-    content: [{
-      type: 'tool-result',
-      toolCallId: 'call-1',
-      content: [{ type: 'text', text: 'screenshot' }, imageBlock('att1')],
-    }],
+    role: 'tool',
+    toolCallId: 'call-1',
+    content: [{ type: 'text', text: 'screenshot' }, imageBlock('att1')],
   }], prepared())
   const tool = wire.find(m => m.role === 'tool')
   const carrier = wire.find(m => m.role === 'user')
   assert.equal(tool.content, 'screenshot')
   assert.ok(carrier.content.some(p => p.type === 'image_url'))
+  // The carrier must FOLLOW the tool message: a user message in between would
+  // break the call/result pairing the gateway validates.
+  assert.ok(wire.indexOf(tool) < wire.indexOf(carrier))
+})
+check('a tool image is prepared, not silently dropped, on an image route', () => {
+  // The exact 0.1.7 regression: a flat `contentHasImage` walk must still see
+  // the tool message's own image, or the text join erases it.
+  const wire = serializeMessages([{
+    role: 'tool',
+    toolCallId: 'call-1',
+    content: [imageBlock('att1')],
+  }], prepared())
+  assert.equal(wire[0].content, '(no output)')
+  assert.equal(wire[1].role, 'user')
+  assert.ok(wire[1].content.some(p => p.type === 'image_url'))
+})
+check('a developer message is refused, not mis-serialized as a user turn', () => {
+  assert.throws(
+    () => serializeMessages([{ role: 'developer', content: [{ type: 'text', text: 'x' }] }], undefined),
+    /cannot represent a developer message/,
+  )
+})
+check('tool-change blocks are refused', () => {
+  assert.throws(
+    () => serializeMessages([{
+      role: 'user',
+      content: [{ type: 'tool-addition', toolName: 'shot' }],
+    }], undefined),
+    /cannot represent tool-change blocks/,
+  )
+})
+check('an unknown user block is refused rather than dropped', () => {
+  assert.throws(
+    () => serializeMessages([{ role: 'user', content: [{ type: 'mystery' }] }], undefined),
+    /cannot represent mystery content/,
+  )
 })
 check('serializeRequest stays text-only without images', () => {
   const body = serializeRequest({ model: 'm', messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }, {})
@@ -352,6 +431,85 @@ check('a vision model with an image passes the gate', async () => {
   }])
   // It will fail on transport (unroutable host), which proves it got PAST the gate.
   assert.ok(!/not configured to accept image input/.test(JSON.stringify(result)))
+})
+
+console.log('\n== plugin wiring (apply) ==')
+// dsh 0.1.7 replaced SettingsForms.installSection with a Config whose fields are
+// \`.volatile()\` live references the Loader commits in place, plus
+// \`settings.configure\` for page policy. This exercises the real \`apply\` against a
+// fake context, so a wrong wiring (a missing effect, a stale snapshot, a route
+// that never re-registers) fails here instead of in the running GUI.
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+const harnessFor = (config) => {
+  const seen = { providers: [], adapters: [], configured: [], replaced: 0, effects: [] }
+  const child = {
+    effect: (fn) => { seen.effects.push(fn()) },
+    settings: {
+      configure: (policy, owner) => { seen.configured.push({ policy, owner }); return () => {} },
+    },
+  }
+  const ctx = {
+    logger: { error: () => {}, warn: () => {}, debug: () => {}, info: () => {} },
+    get: () => undefined,
+    fiber: { id: 'plugin-fiber' },
+    llm: {
+      registerConfigurableProviders: (entries) => seen.providers.push(...entries),
+      registerAdapter: (names, adapter) => {
+        seen.adapters.push({ names, adapter })
+        const handle = () => {}
+        handle.replace = () => { seen.replaced += 1 }
+        return handle
+      },
+    },
+    inject: (deps, callback) => callback(child),
+  }
+  return { ctx, config, seen }
+}
+
+check('apply wires the route, the Models page card, and the page policy', async () => {
+  const { apply, PROVIDER } = await import('../src/index.js')
+  const { ctx, config, seen } = harnessFor(Config({}))
+  apply(ctx, config)
+  assert.equal(seen.providers.length, 1)
+  assert.deepEqual(seen.providers[0], {
+    provider: PROVIDER,
+    displayName: 'CodeBuddy',
+    settingsNs: 'llm-codebuddy',
+    settingsPath: [],
+  })
+  assert.deepEqual(seen.adapters[0].names, [PROVIDER])
+  assert.equal(typeof seen.adapters[0].adapter.stream, 'function')
+  assert.deepEqual(seen.configured[0].policy, { auto: false })
+  assert.equal(seen.configured[0].owner, ctx.fiber)
+  assert.equal(seen.effects.length, 1)
+})
+
+check('a live settings edit reaches the next operation without a remount', async () => {
+  const { apply, PROVIDER } = await import('../src/index.js')
+  const { ctx, config, seen } = harnessFor(Config({}))
+  apply(ctx, config)
+  const adapter = seen.adapters[0].adapter
+  assert.equal((await adapter.resolveModel(PROVIDER, 'anything')).defaultMaxTokens, 384_000)
+  // Exactly what the Loader does to a volatile field on an edit: commit a new
+  // value into the SAME reference the parsed config already holds.
+  config.maxTokens[VOLATILE_WRITE](8192)
+  assert.equal((await adapter.resolveModel(PROVIDER, 'anything')).defaultMaxTokens, 8192)
+})
+
+check('a retry-policy change re-registers the route in place', async () => {
+  const { apply, PROVIDER } = await import('../src/index.js')
+  const { ctx, config, seen } = harnessFor(Config({}))
+  apply(ctx, config)
+  const adapter = seen.adapters[0].adapter
+  // Unchanged: no churn on the ordinary path.
+  await adapter.listModels(PROVIDER)
+  assert.equal(seen.replaced, 0)
+  config.retryPolicy[VOLATILE_WRITE]({ attempts: 3 })
+  await adapter.listModels(PROVIDER)
+  assert.equal(seen.replaced, 1)
+  // Idempotent: the same policy does not re-register again.
+  await adapter.listModels(PROVIDER)
+  assert.equal(seen.replaced, 1)
 })
 
 console.log(`\n${pass} passed, ${fail} failed\n`)
