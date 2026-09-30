@@ -1,6 +1,6 @@
 {
   "name": "dsh-codebuddy-code",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "CodeBuddy LLM provider bundle for the DeepSeek Harness web GUI: registers the `codebuddy` provider route, its Models-page card, and its model picker entries, authenticating against the machine's CodeBuddy desktop-app login, with per-model measured image input",
   "keywords": [
     "deepseek-harness",
@@ -43,7 +43,7 @@
     "prepack": "npm run pack:check",
     "pack": "npm pack",
     "pack:check": "node ./scripts/check-pack.mjs",
-    "test": "node ./tests/image-support.test.mjs",
+    "test": "node ./tests/image-support.test.mjs && node ./tests/runtime-compat.test.mjs",
     "vision-probe": "node ./scripts/vision-probe.mjs --trials=3"
   },
   "dsh": {
@@ -52,16 +52,16 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.3",
+    "@deepseek-ai/schemastery": "^3.18.4",
     "eventsource-parser": "^3.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.3",
-    "@deepseek-ai/dsh-attachment": "^0.1.7-alpha.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.7-alpha.1",
-    "@deepseek-ai/dsh-llm": "^0.1.7-alpha.1",
-    "@deepseek-ai/dsh-settings": "^0.1.7-alpha.1",
-    "@deepseek-ai/dsh-timeout": "^0.1.7-alpha.1",
-    "@deepseek-ai/dsh-util-values": "^0.1.7-alpha.1"
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/dsh-attachment": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-invariants": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-timeout": "^0.2.0-rc.1",
+    "@deepseek-ai/dsh-util-values": "^0.2.0-rc.1"
   }
 }

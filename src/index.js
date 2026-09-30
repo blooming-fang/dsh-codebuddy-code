@@ -3,7 +3,8 @@
  * `ctx.llm`, with connection facts resolved per request instead of frozen at
  * load, so a changed endpoint, catalog, or token path reaches the very next
  * request without restarting anything, while an in-flight stream keeps the
- * facts it started with. On dsh `0.1.7-alpha.1` that liveness comes from the
+ * facts it started with. On dsh `0.2.0-rc.1` (since `0.1.7-alpha.1`) that
+ * liveness comes from the
  * Config's `.volatile()` fields — the Loader commits an edited value into
  * the running fiber's reference without remounting the plugin — which
  * `plainOptions` reads back into a plain snapshot per operation. The one
@@ -169,7 +170,7 @@ const catalogModel = z.object({
 })
 
 // Every field is `.volatile()` because dsh `0.1.7-alpha.1` made that the ONLY
-// editable kind: `SettingsForms.write()` throws "has no volatile fields" for an
+// editable kind (still true on `0.2.0-rc.1`): `SettingsForms.write()` throws "has no volatile fields" for an
 // entry whose schema declares none, and rejects every non-volatile path. A
 // volatile node parses to a live reference the Loader commits into the running
 // fiber without remounting it, which is exactly the "a changed endpoint reaches
@@ -324,7 +325,7 @@ function isVolatileValue(value) {
 /**
  * Read the current value behind every volatile reference of a parsed Config.
  *
- * dsh `0.1.7-alpha.1` parses a `.volatile()` field to a live reference the
+ * dsh `0.2.0-rc.1` (since `0.1.7-alpha.1`) parses a `.volatile()` field to a live reference the
  * Loader updates in place, so the parsed config object keeps one identity while
  * its values change; `plainOptions` is what turns that back into the plain
  * snapshot the resolver judges. Tolerates an already-plain value so the
@@ -340,7 +341,8 @@ export function plainOptions(config) {
 
 /**
  * Whether one parsed Config field is volatile, i.e. editable from the settings
- * UI. Exported for the regression suite that pins the dsh 0.1.7 requirement.
+ * UI. Exported for the regression suite that pins the volatile-Config
+ * requirement every dsh from `0.1.7-alpha.1` through `0.2.0-rc.1` enforces.
  * @param value - one parsed Config field value.
  * @returns whether it is a live volatile reference.
  */
@@ -538,7 +540,8 @@ export function apply(ctx, config) {
   registration = ctx.llm.registerAdapter([PROVIDER], adapter)
   registeredPolicy = lastGood.retryPolicy
 
-  // dsh `0.1.7-alpha.1` dropped `SettingsForms.installSection`; a plugin's
+  // dsh `0.1.7-alpha.1` dropped `SettingsForms.installSection` (unchanged on
+  // `0.2.0-rc.1`); a plugin's
   // Config schema now comes from the module's own `Config` export, its live
   // values from the volatile references the Loader commits in place, and this
   // call only declares the page policy. `auto: false` mirrors every official

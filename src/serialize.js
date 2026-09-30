@@ -5,15 +5,23 @@
  * is replayed as `reasoning_content` only on tool-call turns, mirroring the
  * DeepSeek thinking-mode passback rule the gateway serves unchanged.
  *
- * The harness vocabulary this reads is dsh `0.1.7-alpha.1`'s: a tool result is
- * a first-class `role: 'tool'` message (`toolCallId`, `isError`), NOT a
- * `tool-result` block nested inside a user message. `0.1.7` removed
- * `tool-result` from `ContentBlockMap` and made `contentHasImage` a flat
- * walk, so a nested-block read would miss every tool image and silently erase
- * it. Roles and blocks the chat-completions form cannot represent (a
- * `developer` message, a `tool-addition`/`tool-removal` control block) fail
- * loud instead, exactly as the official `dsh-llm-deepseek` adapter refuses
- * them.
+ * The harness vocabulary this reads is dsh `0.2.0-rc.1`'s (unchanged since
+ * `0.1.7-alpha.1`): a tool result is a first-class `role: 'tool'` message
+ * (`toolCallId`, `isError`), NOT a `tool-result` block nested inside a user
+ * message. `0.1.7` removed `tool-result` from `ContentBlockMap` and made
+ * `contentHasImage` a flat walk, so a nested-block read would miss every tool
+ * image and silently erase it. Roles and blocks the chat-completions form
+ * cannot represent (a `developer` message, a `tool-addition`/`tool-removal`
+ * control block) fail loud instead, exactly as the official
+ * `dsh-llm-deepseek` adapter refuses them.
+ *
+ * dsh `0.2.0-rc.1` added a `file` block to `ContentBlockMap`. The runtime
+ * projects it to deterministic handle text at the adapter boundary
+ * (`projectFilesToText`), unconditionally and for every route, so no adapter
+ * ever receives one. This module therefore has no file branch: a `file` block
+ * that still reaches it is refused like any other unrepresentable block rather
+ * than joined away as text, which is what would silently drop a reference the
+ * model was told it could read.
  *
  * Images ride the OpenAI-family `image_url` content-part form, which the
  * CodeBuddy gateway accepts for every model it serves. Acceptance is NOT
@@ -271,7 +279,7 @@ function toolResultParts(message, useParts, images) {
 
 /**
  * Serialize the conversation. A harness tool result is a first-class
- * `role: 'tool'` message in dsh `0.1.7-alpha.1` and becomes one wire
+ * `role: 'tool'` message in dsh `0.1.7-alpha.1` and later and becomes one wire
  * `{ role: 'tool', tool_call_id }` message.
  *
  * A tool result carrying an image cannot ride a `tool` message (the wire form

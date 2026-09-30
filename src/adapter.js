@@ -168,8 +168,9 @@ function resolveRequestImageTarget(connection, model, ref) {
 
 /**
  * Collect every RETAINED durable image occurrence in a request, in request
- * order. The walk is FLAT and per message, matching dsh `0.1.7-alpha.1`'s own
- * `visitImageBlocks` exactly: a tool result is a first-class `role: 'tool'`
+ * order. The walk is FLAT and per message, matching the runtime's own
+ * `visitImageBlocks` exactly (unchanged on dsh `0.2.0-rc.1`): a tool result is
+ * a first-class `role: 'tool'`
  * message whose content holds its images directly, so the message walk reaches
  * them without descending into a block. Walking any deeper would count
  * occurrences `requiredImageOffload` does not, and the two disagreeing about
@@ -363,12 +364,56 @@ export class CodeBuddyAdapter extends LlmAdapter {
     return Promise.resolve(this.config.options().models.map(model => modelInfo(provider, model)))
   }
 
+  /**
+   * Resolve exact-model metadata for one standalone query. The host calls this
+   * independently of any dispatch (the Models page, a capability probe), so it
+   * takes its own connection snapshot and binds nothing.
+   * @param provider - the `codebuddy` route.
+   * @param model - exact model id named by the request.
+   * @returns exact model identity, context capacity, output cap, and efforts.
+   */
   resolveModel(provider, model, _signal) {
+    return Promise.resolve(this.modelInfoFrom(this.config.options(), provider, model))
+  }
+
+  /**
+   * Bind ONE connection generation to both the exact-model metadata the host
+   * reads and the dispatch that follows it.
+   *
+   * dsh `0.2.0-rc.1` resolves a call through this method and hands its
+   * `stream` back as the dispatch entry point, so a dynamic adapter has a
+   * place to freeze the generation it prepared under. The inherited
+   * implementation (`resolveModel` then `this.stream`) would read the
+   * volatile settings twice — once for the metadata, once at dispatch, which
+   * `llm.prepareCall()` deliberately separates (the loop logs a request header
+   * between the two). An edit landing in that gap would combine one
+   * generation's declared modalities, context capacity, and efforts with
+   * another generation's endpoint, catalog, and bearer session.
+   * @param provider - the `codebuddy` route.
+   * @param model - exact model id named by the request.
+   * @returns one generation's model metadata plus a stream bound to that same generation.
+   */
+  prepareCall(provider, model, _signal) {
     const connection = this.config.options()
+    return Promise.resolve({
+      model: this.modelInfoFrom(connection, provider, model),
+      stream: options => this.streamWithConnection(options, connection),
+    })
+  }
+
+  /**
+   * Exact-model metadata resolved from one already-captured connection
+   * generation, so the caller decides whether that generation is also the one
+   * that dispatches.
+   * @param connection - validated connection facts captured by the caller.
+   * @param provider - the `codebuddy` route.
+   * @param model - exact model id named by the request.
+   */
+  modelInfoFrom(connection, provider, model) {
     const configured = connection.models.find(entry => entry.id === model)
     const contextWindow = configured?.contextWindow
       ?? connection.defaultContextWindow
-    return Promise.resolve({
+    return {
       // An uncatalogued model declares text-only. Image acceptance is not
       // capability here — the gateway takes an image part for every model and a
       // text-only one then hallucinates a description — so "unknown" must not
@@ -396,16 +441,30 @@ export class CodeBuddyAdapter extends LlmAdapter {
                 : HIGH_REASONING_EFFORT,
           },
         }),
-    })
+    }
   }
 
-  async * stream(options) {
-    // One resolution per stream call: connection facts and the session
-    // freeze here and hold for this whole request, so an in-flight stream
-    // never observes a configuration change and the next call re-resolves.
-    // The session resolves *from this snapshot*, so an endpoint and the token
-    // sent to it can never come from different configuration generations.
-    const connection = this.config.options()
+  /**
+   * Stream one call on a generation captured here. The host normally dispatches
+   * through the stream {@link prepareCall} bound; this entry point is for a
+   * caller that starts a request directly.
+   */
+  stream(options) {
+    return this.streamWithConnection(options, this.config.options())
+  }
+
+  /**
+   * Stream one call on an ALREADY-CAPTURED connection generation.
+   *
+   * The generation (endpoint, catalog, token paths, budgets, timeout, defaults)
+   * is held for the whole request, so an in-flight stream never observes a
+   * configuration change and the next call re-resolves. The bearer session
+   * resolves *from this same snapshot*, so the endpoint and the token sent to it
+   * can never come from different configuration generations.
+   * @param options - the harness request, already projected by the runtime.
+   * @param connection - the connection generation this dispatch is bound to.
+   */
+  async * streamWithConnection(options, connection) {
     const session = await this.config.resolveSession(connection)
     const consumer = new AbortController()
     const upstream = options.signal === undefined

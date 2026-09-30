@@ -27,6 +27,7 @@ const REQUIRED = [
   // maintainer can re-derive or verify them.
   'scripts/vision-probe.mjs',
   'tests/image-support.test.mjs',
+  'tests/runtime-compat.test.mjs',
 ]
 
 const missing = []

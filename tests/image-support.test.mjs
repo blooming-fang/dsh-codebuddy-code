@@ -277,6 +277,50 @@ check('serializeRequest stays text-only without images', () => {
   assert.equal(body.stream, true)
 })
 
+check('a file block is refused, never flattened into text', () => {
+  // dsh 0.2.0-rc.1 added a `file` block to ContentBlockMap. The runtime projects
+  // it to handle text at the adapter boundary, so this module has no file
+  // branch; if one ever leaked through, joining the text blocks would drop the
+  // reference and answer as though the file had never been attached.
+  assert.throws(
+    () => serializeMessages([{
+      role: 'user',
+      content: [{
+        type: 'file',
+        attachment: { attachmentId: 'sha256:0123456789abcdef', name: 'notes.txt', bytes: 1234 },
+      }],
+    }], undefined),
+    /cannot represent file content/,
+  )
+})
+check('a tool schema carrying deferLoading still serializes', () => {
+  // ToolSchema gained `deferLoading` in 0.2.0. This route declares no
+  // `toolUpdate`, so the runtime strips the flag before dispatch; the wire form
+  // has no field for it either way.
+  const body = serializeRequest({
+    model: 'm',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }],
+    tools: [{ name: 'shot', description: 'take a screenshot', parameters: {}, deferLoading: true }],
+  }, {})
+  assert.equal(body.tools[0].function.name, 'shot')
+  assert.equal(body.tools[0].deferLoading, undefined)
+})
+check('an identity-free user input serializes like a durable user message', () => {
+  // 0.2.0 named this shape RequestUserInput: one request's user input, with no
+  // durable Session identity or source.
+  const wire = serializeMessages([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], undefined)
+  assert.equal(wire[0].role, 'user')
+  assert.equal(wire[0].content, 'hi')
+})
+check('a session-title call disables thinking on the wire', () => {
+  // 0.2.0 fixed the auxiliary-call vocabulary to compaction | session-title; a
+  // title must produce visible text, so it never inherits the deployment thinking
+  // policy.
+  const body = serializeRequest({ model: 'm', purpose: 'session-title', messages: [] }, { thinking: 'enabled' })
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+  assert.equal(body.reasoning_effort, undefined)
+})
+
 console.log('\n== durable offload projection ==')
 check('an offloaded occurrence becomes placeholder text, not a silent drop', () => {
   // Offloading is a durable surface decision now: the adapter substitutes text
@@ -513,4 +557,81 @@ check('a retry-policy change re-registers the route in place', async () => {
 })
 
 console.log(`\n${pass} passed, ${fail} failed\n`)
+console.log('\n== one-generation binding (dsh 0.2.0 prepareCall) ==')
+// dsh 0.2.0-rc.1 resolves every call through LlmAdapter.prepareCall and hands
+// the returned `stream` back as the dispatch entry point, precisely so a
+// dynamic adapter can freeze the generation it prepared under. The inherited
+// implementation would read the volatile settings twice — once for the model
+// metadata, once at dispatch — and llm.prepareCall() deliberately separates
+// those two points with a logged request header.
+const connectionGeneration = (endpoint, inputModalities) => ({
+  endpoint,
+  models: [{ id: 'm', inputModalities }],
+  defaults: { reasoningEffort: 'off' },
+  maxTokens: 1024,
+  defaultContextWindow: 1000,
+  imagePixelBudget: 640000,
+  imageMaxBytes: 1048576,
+  streamIdleTimeoutMs: 1000,
+  retryPolicy: {},
+})
+const switchingAdapter = () => {
+  const generations = [
+    connectionGeneration('https://first.invalid', ['text']),
+    connectionGeneration('https://second.invalid', ['text', 'image']),
+  ]
+  const state = { current: 0 }
+  const adapter = new CodeBuddyAdapter({
+    options: () => generations[state.current],
+    resolveSession: async () => ({ accessToken: 't' }),
+    resolveAttachments: () => stubAttachments({
+      mediaType: 'image/png', data: Uint8Array.from([1]), bytes: 3, width: 8, height: 8,
+    }),
+  })
+  return { adapter, state }
+}
+
+check('prepareCall binds the model metadata and the dispatch to one generation', async () => {
+  const { adapter, state } = switchingAdapter()
+  const prepared = await adapter.prepareCall('codebuddy', 'm')
+  // The metadata the host reads comes from generation 0.
+  assert.deepEqual(prepared.model.inputModalities, ['text'])
+  // A settings edit lands in the gap llm.prepareCall() leaves open.
+  state.current = 1
+  let result
+  try {
+    await collect(prepared.stream({ model: 'm', messages: [{ role: 'user', content: [imageBlock('a1')] }] }))
+    result = {}
+  } catch (error) {
+    result = { code: error.code, message: error.message }
+  }
+  // Generation 0 is text-only, so the image is refused BEFORE any dispatch.
+  // A dispatch that re-read the settings would have seen generation 1 (vision)
+  // and gone to the network instead.
+  assert.match(result.message ?? '', /not configured to accept image input/)
+  assert.ok(!/TRANSPORT|fetch failed|ENOTFOUND|EAI_AGAIN/.test(JSON.stringify(result)))
+})
+
+check('resolveModel stays a standalone query with its own snapshot', async () => {
+  // The Models page and capability probes call this with no dispatch to bind,
+  // so it must observe the edit the prepared call must not.
+  const { adapter, state } = switchingAdapter()
+  assert.deepEqual((await adapter.resolveModel('codebuddy', 'm')).inputModalities, ['text'])
+  state.current = 1
+  assert.deepEqual((await adapter.resolveModel('codebuddy', 'm')).inputModalities, ['text', 'image'])
+})
+
+check('apply exposes an adapter that resolves calls through prepareCall', async () => {
+  const { apply, PROVIDER } = await import('../src/index.js')
+  const { ctx, config, seen } = harnessFor(Config({}))
+  apply(ctx, config)
+  const adapter = seen.adapters[0].adapter
+  assert.equal(typeof adapter.prepareCall, 'function')
+  const prepared = await adapter.prepareCall(PROVIDER, 'anything')
+  assert.equal(prepared.model.id, 'anything')
+  assert.deepEqual(prepared.model.inputModalities, ['text'])
+  assert.equal(typeof prepared.stream, 'function')
+  assert.equal(prepared.model.defaultMaxTokens, 384_000)
+})
+
 process.exit(fail === 0 ? 0 : 1)
